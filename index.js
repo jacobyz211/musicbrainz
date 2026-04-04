@@ -924,11 +924,28 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: MusicBrainz first, then Bandcamp ────────────────────────────────
+// helper: fetch cover art for first release of a recording (Cover Art Archive)
+async function mbGetCoverArtForRecording(rec) {
+  const releases = rec.releases || rec['release-list'] || [];
+  if (!releases.length) return null;
+  const rel = releases[0];
+  if (!rel.id) return null;
+  try {
+    const r = await fetch(`https://coverartarchive.org/release/${rel.id}/front-250`, {
+      redirect: 'follow'
+    });
+    if (!r.ok) return null;
+    return r.url; // actual image URL after redirects
+  } catch {
+    return null;
+  }
+}
+
+// ─── Search: MusicBrainz ONLY, strict ────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const { token } = req.params;
-  const q = (req.query.q || '').trim();
-  if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+  const qRaw = (req.query.q || '').trim();
+  if (!qRaw) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
   const meta = tokens.get(token);
   meta.searches = (meta.searches || 0) + 1;
@@ -936,49 +953,32 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (meta.searches % 5 === 0) await rSet(`bc:token:${token}`, meta);
 
   try {
-    const [
-      mbRecordings,
-      allRes,
-      artistsRes,
-      showsList
-    ] = await Promise.all([
-      mbSearchRecordings(q, 20),
-      bcfetch.search.all({ query: q, page: 1 }),
-      bcfetch.search.artistsAndLabels({ query: q, page: 1 }),
-      bcfetch.show.list({})
-    ]);
+    // Parse "Artist - Title" if present; fall back to full query as title
+    const parts  = qRaw.split(' - ');
+    const title  = parts[parts.length - 1].trim();
+    const artist = parts.length > 1 ? parts[0].trim() : '';
 
-    const mbTracks = mbRecordings.map(mapMbRecordingToTrack);
+    const mbQuery = artist
+      ? `recording:"${title}" AND artist:"${artist}"`
+      : `recording:"${title}"`;
 
-    const items  = allRes?.items || [];
-    const aItems = artistsRes?.items || [];
-    const shows  = showsList || [];
+    // Ask for up to 20, then filter down to those with ISRCs to reduce noise
+    const recs = await mbSearchRecordings(mbQuery, 20);
+    const filtered = (recs || []).filter(r => Array.isArray(r.isrcs) && r.isrcs.length);
 
-    const bcRawTracks = items
-      .filter(i => i.type === 'track')
-      .map(t => mapTrack(t));
+    // Limit to first 10 to keep things snappy
+    const top = filtered.slice(0, 10);
 
-    const albums  = items.filter(i => i.type === 'album').map(mapAlbum);
-    const artists = aItems.map(mapArtist);
+    const tracks = [];
+    for (const rec of top) {
+      const t = mapMbRecordingToTrack(rec);
+      t.artworkURL = await mbGetCoverArtForRecording(rec); // may be null if no art
+      tracks.push(t);
+      await logTrack(token, t);
+    }
 
-    const playlists = shows
-      .filter(s => (s.title || '').toLowerCase().includes(q.toLowerCase()))
-      .slice(0, 20)
-      .map(s => ({
-        id:          encodeId(s.url),
-        title:       s.title || 'Unknown',
-        description: s.description || null,
-        artworkURL:  s.imageUrl || null,
-        creator:     'Bandcamp Daily'
-      }));
-
-    const bcTracksEnriched = await enrichTracks(bcRawTracks);
-
-    const tracks = [...mbTracks, ...bcTracksEnriched];
-
-    for (const t of tracks) await logTrack(token, t);
-
-    res.json({ tracks, albums, artists, playlists });
+    // MB-only: no Bandcamp albums/artists/playlists in search results
+    res.json({ tracks, albums: [], artists: [], playlists: [] });
   } catch (err) {
     console.error('[search]', err.message);
     res.status(500).json({ error: 'Search failed.' });
