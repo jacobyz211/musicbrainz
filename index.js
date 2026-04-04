@@ -3,21 +3,92 @@ import cors     from 'cors';
 import bcfetch  from 'bandcamp-fetch';
 import PQueue   from 'p-queue';
 import Redis    from 'ioredis';
+import axios    from 'axios';
 import { randomBytes } from 'crypto';
 
+// ─── Base setup ───────────────────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// ─── Hi-Fi / Claudochrome instances (monochrome.tf) ──────────────────────────
+const HIFI_INSTANCES = [
+  'https://ohio-1.monochrome.tf',
+  'https://frankfurt-1.monochrome.tf',
+  'https://eu-central.monochrome.tf',
+  'https://us-west.monochrome.tf',
+  'https://hifi.geeked.wtf',
+  'https://hifi-one.spotisaver.net',
+  'https://monochrome-api.samidy.com'
+];
+let activeInstance  = HIFI_INSTANCES[0];
+let instanceHealthy = false;
+
+async function hifiGet(basePath, params) {
+  const errors    = [];
+  const instances = instanceHealthy
+    ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
+    : HIFI_INSTANCES.slice();
+
+  for (const inst of instances) {
+    try {
+      const r = await axios.get(inst + basePath, {
+        params:  params || {},
+        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        timeout: 15000
+      });
+      if (r.status === 200 && r.data) {
+        if (inst !== activeInstance) {
+          activeInstance  = inst;
+          instanceHealthy = true;
+          console.log('[hifi] switched to ' + inst);
+        }
+        return r.data;
+      }
+    } catch (e) {
+      errors.push(inst + ': ' + e.message);
+    }
+  }
+  throw new Error('All Hi-Fi instances failed: ' + errors.slice(-2).join(' | '));
+}
+
+async function hifiGetSafe(path, params) {
+  try { return await hifiGet(path, params); }
+  catch { return null; }
+}
+
+async function checkInstances() {
+  for (const inst of HIFI_INSTANCES) {
+    try {
+      await axios.get(inst + '/search/', {
+        params: { s: 'test', limit: 1 },
+        timeout: 8000
+      });
+      activeInstance  = inst;
+      instanceHealthy = true;
+      console.log('[hifi] healthy: ' + inst);
+      return;
+    } catch {}
+  }
+  instanceHealthy = false;
+  console.warn('[hifi] WARNING: no healthy Hi-Fi instances.');
+}
+checkInstances();
+setInterval(checkInstances, 15 * 60 * 1000);
+
 // ─── Redis ────────────────────────────────────────────────────────────────────
 const redis = process.env.REDIS_URL
-  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 2, enableReadyCheck: false })
+  ? new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: false })
   : null;
+
 if (redis) {
   redis.on('connect', () => console.log('[Redis] Connected'));
   redis.on('error',   e  => console.error('[Redis] Error:', e.message));
 }
+
 async function rGet(key) {
   if (!redis) return null;
   try { const v = await redis.get(key); return v ? JSON.parse(v) : null; } catch { return null; }
@@ -39,13 +110,18 @@ async function rList(key) {
 }
 async function rDel(key) {
   if (!redis) return;
-  try { await redis.del(key); } catch { }
+  try { await redis.del(key); } catch {}
 }
 
 // ─── In-memory stores ─────────────────────────────────────────────────────────
+// meta: { createdAt, searches, streams, lastUsed, soundcloudClientId?, migratedAt? }
 const tokens       = new Map();
 const trackHistory = new Map();
 
+// shared SoundCloud client_id (auto-scraped, like your SC addon)
+let SHARED_CLIENT_ID = process.env.SC_CLIENT_ID || null;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function generateToken() { return randomBytes(16).toString('hex'); }
 
 function getBaseUrl(req) {
@@ -80,7 +156,7 @@ async function logTrack(token, track) {
 
 // ─── MusicBrainz ──────────────────────────────────────────────────────────────
 const mbQueue   = new PQueue({ intervalCap: 1, interval: 1100 });
-const MB_UA     = 'BandcampEclipseAddon/1.0.0 (your@email.com)';
+const MB_UA     = 'BandcampEclipseAddon/1.0.0 (you@example.com)';
 const isrcCache = new Map();
 
 async function mbGet(path) {
@@ -106,25 +182,24 @@ async function lookupISRC(title, artist) {
   return isrc;
 }
 
-async function enrichTracks(tracks, timeoutMs = 4500) {
-  const deadline = Date.now() + timeoutMs;
-  return Promise.all(tracks.map(async track => {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) return track;
-    const isrc = await Promise.race([
-      lookupISRC(track.title, track.artist),
-      new Promise(r => setTimeout(() => r(null), remaining))
-    ]);
-    return isrc ? { ...track, isrc } : track;
-  }));
+async function mbSearchRecordings(query, limit = 20) {
+  const q = query.trim();
+  if (!q) return [];
+  const path = `/recording?query=${encodeURIComponent(q)}&fmt=json&limit=${limit}`;
+  const data = await mbQueue.add(() => mbGet(path));
+  return data?.recordings || [];
 }
 
-// ─── Bandcamp mappers ─────────────────────────────────────────────────────────
+// ─── Bandcamp mappers + ID wrappers ──────────────────────────────────────────
 const encodeId = url => Buffer.from(url ?? '').toString('base64url');
 const decodeId = id => { try { return Buffer.from(id, 'base64url').toString('utf8'); } catch { return ''; } };
 
+const encodeMbId = mbid => `mb:${mbid}`;
+const encodeScId = scId => `sc:${scId}`;
+const encodeBcId = url  => `bc:${encodeId(url)}`;
+
 const mapTrack = (t, fallbackArtist) => ({
-  id:         encodeId(t.url),
+  id:         encodeBcId(t.url),
   title:      t.name,
   artist:     t.artist?.name || t.publisher?.name || t.publisher_metadata?.artist || fallbackArtist || 'Unknown',
   album:      t.album?.name,
@@ -149,6 +224,318 @@ const mapArtist = a => ({
   artworkURL: a.imageUrl || null
 });
 
+const mapMbRecordingToTrack = rec => {
+  const title  = rec.title || '';
+  const artist = (rec['artist-credit']?.map(ac => ac.name).join(', ')) || 'Unknown';
+  const isrc   = (rec.isrcs && rec.isrcs[0]) || null;
+  const durMs  = rec.length || null;
+  return {
+    id:         encodeMbId(rec.id),
+    title,
+    artist,
+    album:      rec['release-group']?.title || null,
+    duration:   durMs ? Math.round(durMs / 1000) : undefined,
+    artworkURL: null,
+    streamURL:  null,
+    format:     'flac',
+    isrc
+  };
+};
+
+async function enrichTracks(tracks, timeoutMs = 4500) {
+  const deadline = Date.now() + timeoutMs;
+  return Promise.all(tracks.map(async track => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return track;
+    const isrc = await Promise.race([
+      lookupISRC(track.title, track.artist),
+      new Promise(r => setTimeout(() => r(null), remaining))
+    ]);
+    return isrc ? { ...track, isrc } : track;
+  }));
+}
+
+// ─── SoundCloud client_id and helpers (ported from your SC addon) ────────────
+const ID_PATTERNS = [
+  /client_id\s*[=:,]\s*["']([a-zA-Z0-9]{32})["']/,
+  /"client_id"\s*:\s*"([a-zA-Z0-9]{32})"/,
+  /"client_id","([a-zA-Z0-9]{32})"/,
+  /client_id=([a-zA-Z0-9]{32})[&"'\s,)]/
+];
+
+const TRACK_CACHE = new Map();
+const sleep      = ms => new Promise(r => setTimeout(r, ms));
+
+function findId(text) {
+  for (const re of ID_PATTERNS) {
+    const m = text.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+function cleanText(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+
+function parseArtistTitle(track) {
+  const raw  = cleanText(track && track.title);
+  const meta = cleanText(
+    (track && track.publisher_metadata &&
+     (track.publisher_metadata.artist || track.publisher_metadata.writer_composer)) || ''
+  );
+  const up   = cleanText(track && track.user && track.user.username);
+  if (raw.indexOf(' - ') !== -1) {
+    const parts = raw.split(' - ');
+    const L     = cleanText(parts[0]);
+    const R     = cleanText(parts.slice(1).join(' - '));
+    if (L && R) return { artist: meta || L, title: R, rawTitle: raw, uploader: up };
+  }
+  return { artist: meta || up, title: raw, rawTitle: raw, uploader: up };
+}
+
+function rememberTrack(t) {
+  if (!t || !t.id) return;
+  const m = parseArtistTitle(t);
+  TRACK_CACHE.set(String(t.id), {
+    id:       String(t.id),
+    artist:   m.artist,
+    title:    m.title,
+    rawTitle: m.rawTitle,
+    uploader: m.uploader
+  });
+}
+
+function artworkUrl(raw, fb) {
+  const s = raw || fb || '';
+  return s ? s.replace('-large', '-t500x500') : null;
+}
+
+async function getHtml(url) {
+  try {
+    const r = await axios.get(url, {
+      headers: {
+        'User-Agent':      UA,
+        'Accept':          'text/html',
+        'Accept-Encoding': 'gzip, deflate'
+      },
+      timeout:       15000,
+      decompress:    true,
+      responseType:  'text',
+      validateStatus: s => s < 500
+    });
+    return r.data || '';
+  } catch { return null; }
+}
+
+async function getJs(url) {
+  try {
+    const r = await axios.get(url, {
+      headers: {
+        'User-Agent': UA,
+        'Accept':     '*/*',
+        'Referer':    'https://soundcloud.com/'
+      },
+      timeout:       12000,
+      decompress:    true,
+      responseType:  'text',
+      validateStatus: s => s < 500
+    });
+    if (r.status !== 200 || (r.data || '').length < 5000) return null;
+    return r.data;
+  } catch { return null; }
+}
+
+async function tryExtractClientId() {
+  for (const pu of ['https://soundcloud.com', 'https://soundcloud.com/discover']) {
+    const html = await getHtml(pu);
+    if (!html || html.length < 5000) continue;
+
+    // inline scripts
+    for (const m of html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)) {
+      const id = findId(m[1] || '');
+      if (id) return id;
+    }
+
+    // JS assets
+    const urls = Array.from(new Set([
+      ...Array.from(html.matchAll(/https?:\/\/a-v2\.sndcdn\.com\/assets\/[a-zA-Z0-9.\-]+\.js/g)).map(x => x[0]),
+      ...Array.from(html.matchAll(/src="([^"]+\.js)"/g)).map(x => x[1])
+    ])).reverse().slice(0, 10);
+
+    for (const u of urls) {
+      const js = await getJs(u);
+      if (!js) continue;
+      const bid = findId(js);
+      if (bid) return bid;
+    }
+  }
+  return null;
+}
+
+async function fetchSharedClientId() {
+  if (process.env.SC_CLIENT_ID) {
+    SHARED_CLIENT_ID = process.env.SC_CLIENT_ID;
+    console.log('[clientid] from env');
+    return;
+  }
+  const delays = [5000, 10000, 15000, 30000, 60000];
+  let attempt  = 0;
+  // simple background loop
+  while (!SHARED_CLIENT_ID) {
+    attempt++;
+    try {
+      const id = await tryExtractClientId();
+      if (!id) throw new Error('not found');
+      SHARED_CLIENT_ID = id;
+      console.log('[clientid] obtained attempt ' + attempt);
+      setTimeout(() => { SHARED_CLIENT_ID = null; fetchSharedClientId(); }, 6 * 60 * 60 * 1000);
+      return;
+    } catch {
+      await sleep(delays[Math.min(attempt - 1, delays.length - 1)]);
+      console.log('[clientid] retrying...');
+    }
+  }
+}
+fetchSharedClientId();
+
+async function scGet(cid, url, params, retried) {
+  if (!cid) throw new Error('No client_id');
+  try {
+    const r = await axios.get(url, {
+      params: Object.assign({}, params || {}, { client_id: cid }),
+      headers: {
+        'User-Agent': UA,
+        'Accept':     'application/json'
+      },
+      timeout:    12000,
+      decompress: true
+    });
+    return r.data;
+  } catch (e) {
+    if (!retried && e.response && (e.response.status === 401 || e.response.status === 403)) {
+      SHARED_CLIENT_ID = null;
+      fetchSharedClientId();
+      await sleep(3000);
+      return scGet(SHARED_CLIENT_ID, url, params, true);
+    }
+    throw e;
+  }
+}
+
+async function getOrFetchGlobalSoundCloudClientId() {
+  if (SHARED_CLIENT_ID) return SHARED_CLIENT_ID;
+  await fetchSharedClientId();
+  return SHARED_CLIENT_ID;
+}
+
+async function resolveSoundCloudStream(scId, clientId) {
+  if (!clientId) return null;
+  try {
+    // using progressive stream; you can adjust to HLS if you want
+    const data = await scGet(
+      clientId,
+      `https://api-v2.soundcloud.com/tracks/soundcloud:tracks:${scId}`,
+      {}
+    );
+    const transcodings = data?.media?.transcodings || [];
+    const prog = transcodings.find(t => (t.format?.protocol === 'progressive'));
+    const target = prog || transcodings[0];
+    if (!target) return null;
+
+    const transData = await scGet(clientId, target.url, {});
+    const url = transData?.url;
+    if (!url) return null;
+    return { url, format: 'mp3', quality: 'standard' };
+  } catch (e) {
+    console.warn('[sc stream]', e.message);
+    return null;
+  }
+}
+
+// ─── Hi-Fi smart search based on SC meta (ported) ────────────────────────────
+async function hifiFindBestTrack(meta, albumName) {
+  if (!meta || !meta.title) return null;
+  const baseTitle  = meta.title;
+  const baseArtist = meta.artist || meta.uploader || '';
+  const queries    = [];
+
+  if (baseArtist) {
+    queries.push(baseArtist + ' ' + baseTitle);
+    queries.push(baseTitle + ' ' + baseArtist);
+  }
+  queries.push(baseTitle);
+  if (albumName) {
+    queries.push(baseTitle + ' ' + albumName);
+  }
+
+  const norm = str => String(str || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const wantTitle  = norm(baseTitle);
+  const wantArtist = norm(baseArtist);
+
+  for (const q of queries) {
+    try {
+      const sData = await hifiGetSafe('/search/', { s: q, limit: 5, offset: 0 });
+      if (!sData) continue;
+
+      let items = [];
+      if (sData.data && Array.isArray(sData.data.items)) items = sData.data.items;
+      else if (Array.isArray(sData.items))               items = sData.items;
+      else if (Array.isArray(sData.data))                items = sData.data;
+      if (!items.length) continue;
+
+      const ranked = items.slice().sort((a, b) => {
+        const aTitle  = norm(a.title);
+        const bTitle  = norm(b.title);
+        const aArtist = norm(
+          (a.artist && a.artist.name) ||
+          (a.artists && a.artists[0] && a.artists[0].name) ||
+          ''
+        );
+        const bArtist = norm(
+          (b.artist && b.artist.name) ||
+          (b.artists && b.artists[0] && b.artists[0].name) ||
+          ''
+        );
+
+        let aScore = 0, bScore = 0;
+        if (aTitle === wantTitle) aScore += 5;
+        if (bTitle === wantTitle) bScore += 5;
+        if (wantArtist && aArtist === wantArtist) aScore += 5;
+        if (wantArtist && bArtist === wantArtist) bScore += 5;
+        if (wantTitle && aTitle.includes(wantTitle)) aScore += 2;
+        if (wantTitle && bTitle.includes(wantTitle)) bScore += 2;
+        if (wantArtist && aArtist.includes(wantArtist)) aScore += 2;
+        if (wantArtist && bArtist.includes(wantArtist)) bScore += 2;
+        return bScore - aScore;
+      });
+
+      const best = ranked[0];
+      if (!best) continue;
+
+      const bestTitle  = norm(best.title);
+      const bestArtist = norm(
+        (best.artist && best.artist.name) ||
+        (best.artists && best.artists[0] && best.artists[0].name) ||
+        ''
+      );
+
+      const titleGood =
+        wantTitle &&
+        (bestTitle === wantTitle || bestTitle.includes(wantTitle));
+
+      const artistGood =
+        !wantArtist ||
+        (bestArtist &&
+         (bestArtist === wantArtist || bestArtist.includes(wantArtist)));
+
+      if (wantArtist) {
+        if (titleGood && artistGood) return best;
+      } else {
+        if (bestTitle === wantTitle) return best;
+      }
+    } catch {}
+  }
+  return null;
+}
+
 // ─── Web UI ───────────────────────────────────────────────────────────────────
 function buildPage(baseUrl) {
   return `<!DOCTYPE html>
@@ -156,7 +543,7 @@ function buildPage(baseUrl) {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Bandcamp x MusicBrainz - Eclipse Addon</title>
+<title>Bandcamp + MusicBrainz + HiFi/SC</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -241,17 +628,13 @@ footer a{color:var(--muted);text-decoration:underline}
 <div class="page">
 <header>
   <div class="logo">&#127925;</div>
-  <h1>Bandcamp x MusicBrainz</h1>
-  <p class="sub">Eclipse Music Addon &mdash; ${baseUrl}</p>
+  <h1>Bandcamp x MusicBrainz + HiFi/SC</h1>
+  <p class="sub">Eclipse Music Addon — ${baseUrl}</p>
   <div class="badges">
-    <span class="badge bb">Search</span>
-    <span class="badge bb">Stream</span>
-    <span class="badge bb">Albums</span>
-    <span class="badge bb">Artists</span>
-    <span class="badge bb">Playlists</span>
+    <span class="badge bb">MusicBrainz</span>
+    <span class="badge bb">Bandcamp</span>
+    <span class="badge bo">HiFi → SoundCloud → BC</span>
     <span class="badge bg">ISRC Enrichment</span>
-    <span class="badge bg">Synced Lyrics</span>
-    <span class="badge bo">Bandcamp Daily</span>
   </div>
 </header>
 
@@ -259,16 +642,16 @@ footer a{color:var(--muted);text-decoration:underline}
   <div class="ct"><span class="dot" style="background:var(--green)"></span>How It Works</div>
   <div class="steps">
     <div class="step"><div class="sn">1</div><div class="sb">
-      <strong>Generate your personal URL below</strong>
-      <span>Each person gets their own URL so your MusicBrainz rate limit (1 req/sec) stays separate from every other user. Saved to Redis so it survives server restarts.</span>
+      <strong>Optional: SoundCloud client_id</strong>
+      <span>Enter your SoundCloud client_id to use your own API quota. Leave blank and the addon will scrape a shared client_id automatically.</span>
     </div></div>
     <div class="step"><div class="sn">2</div><div class="sb">
-      <strong>Install in Eclipse Music</strong>
-      <span>Settings &rarr; Connections &rarr; Add Connection &rarr; Addon &rarr; paste your URL &rarr; Install.</span>
+      <strong>Generate your personal URL</strong>
+      <span>Each person gets their own URL so your MusicBrainz rate limit (1 req/sec) and SoundCloud usage stay separate.</span>
     </div></div>
     <div class="step"><div class="sn">3</div><div class="sb">
-      <strong>Search Bandcamp inside Eclipse</strong>
-      <span>Tracks, albums, artists, and Bandcamp Daily playlists load natively. MusicBrainz adds ISRC codes so Eclipse shows synced lyrics and rich artwork automatically.</span>
+      <strong>Search in Eclipse</strong>
+      <span>Search combines MusicBrainz and Bandcamp. Streams prefer HiFi instances first, then SoundCloud, then Bandcamp as fallback.</span>
     </div></div>
   </div>
 </div>
@@ -276,12 +659,16 @@ footer a{color:var(--muted);text-decoration:underline}
 <div class="card">
   <div class="ct"><span class="dot" style="background:var(--green)"></span>Generate Your URL</div>
   <div id="redisChip" class="rchip off"><span class="rdot"></span>Checking Redis...</div>
-  <button class="btn btn-g btn-full" id="genBtn" onclick="generate()">&#9889; Generate My Personal URL</button>
+  <div class="note">SoundCloud Client ID (optional):</div>
+  <div class="irow" style="margin-bottom:8px">
+    <input type="text" id="scClientId" placeholder="Leave blank to use shared auto client_id"/>
+  </div>
+  <button class="btn btn-g btn-full" id="genBtn" onclick="generate()">⚡ Generate My Personal URL</button>
   <div class="urlbox" id="genBox">
     <code id="genUrl"></code>
     <button class="btn btn-gh btn-sm cpybtn" id="genCpy" onclick="cp('genUrl','genCpy')">Copy</button>
   </div>
-  <div class="pill" id="genPill">Token: <strong id="genTok"></strong><br>Saved to Redis &mdash; survives server restarts automatically.</div>
+  <div class="pill" id="genPill">Token: <strong id="genTok"></strong><br>Saved to Redis — survives server restarts automatically.</div>
   <div class="alert" id="genAlert"><span class="ai"></span><span id="genMsg"></span></div>
 </div>
 
@@ -298,7 +685,7 @@ footer a{color:var(--muted);text-decoration:underline}
 
 <div class="card">
   <div class="ct"><span class="dot" style="background:var(--blue)"></span>Update an Existing URL</div>
-  <p class="note">Paste your old addon URL to migrate to a fresh token. Track history is preserved in Redis.</p>
+  <p class="note">Paste your old addon URL to migrate to a fresh token. Track history and SoundCloud client_id (if set) are preserved.</p>
   <div class="irow">
     <input type="text" id="oldUrl" placeholder="https://your-app.onrender.com/u/abc123.../manifest.json"/>
     <button class="btn btn-b btn-sm" onclick="update()">Update</button>
@@ -317,16 +704,14 @@ footer a{color:var(--muted);text-decoration:underline}
   <p class="note">Downloads every track discovered through your addon as a CSV including ISRC codes. Pulled from Redis so it works even after a restart.</p>
   <div class="irow">
     <input type="text" id="expInput" placeholder="Paste your token or full addon URL"/>
-    <button class="btn btn-gh btn-sm" onclick="exportCSV()">&#8595; Download CSV</button>
+    <button class="btn btn-gh btn-sm" onclick="exportCSV()">↓ Download CSV</button>
   </div>
   <div class="alert" id="expAlert"><span class="ai"></span><span id="expMsg"></span></div>
   <p style="font-size:12px;color:var(--muted);margin-top:10px">Your token is the 32-char hex string after <code style="background:var(--sf2);padding:1px 5px;border-radius:4px">/u/</code> in your URL.</p>
 </div>
 
 <footer>
-  Bandcamp x MusicBrainz Eclipse Addon &nbsp;&middot;&nbsp;
-  <a href="https://bandcamp.com" target="_blank">Bandcamp</a> &nbsp;&middot;&nbsp;
-  <a href="https://musicbrainz.org" target="_blank">MusicBrainz</a>
+  Bandcamp + MusicBrainz + HiFi/SC Addon · <a href="${baseUrl}" target="_blank">${baseUrl}</a>
 </footer>
 </div>
 
@@ -346,7 +731,7 @@ function cp(src,btn){
 }
 function exTok(s){
   s=(s||'').trim();
-  var m=s.match(/\/u\/([a-f0-9]{32})(\/|$)/);
+  var m=s.match(/\\/u\\/([a-f0-9]{32})(\\/|$)/);
   if(m)return m[1];
   return /^[a-f0-9]{32}$/.test(s)?s:null;
 }
@@ -377,7 +762,9 @@ function generate(){
   ha('genAlert');
   var btn=document.getElementById('genBtn');
   btn.disabled=true;btn.textContent='Generating...';
-  fetch('/api/generate',{method:'POST'}).then(function(r){return r.json()}).then(function(d){
+  var scId=document.getElementById('scClientId').value.trim();
+  fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({soundcloudClientId:scId||null})})
+  .then(function(r){return r.json()}).then(function(d){
     if(d.error){sa('genAlert','genMsg','err',d.error);return}
     document.getElementById('genUrl').textContent=d.url;
     document.getElementById('genBox').classList.add('show');
@@ -387,7 +774,7 @@ function generate(){
     sa('genAlert','genMsg','ok','Your personal URL is ready - paste it into Eclipse to install.');
     loadStats(d.token);
   }).catch(function(e){sa('genAlert','genMsg','err',e.message)})
-  .finally(function(){btn.disabled=false;btn.textContent='Generate My Personal URL'});
+  .finally(function(){btn.disabled=false;btn.textContent='⚡ Generate My Personal URL'});
 }
 function update(){
   ha('updAlert');
@@ -420,13 +807,43 @@ function exportCSV(){
 
 // ─── API routes ───────────────────────────────────────────────────────────────
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', redis: !!(redis && redis.status === 'ready'), tokens: tokens.size, isrcCacheSize: isrcCache.size });
+app.get('/api/health', async (req, res) => {
+  let redisOk = false;
+  if (redis) {
+    try {
+      const pong = await redis.ping();
+      redisOk = pong === 'PONG';
+    } catch {
+      redisOk = false;
+    }
+  }
+  res.json({
+    status: 'ok',
+    redis: redisOk,
+    tokens: tokens.size,
+    isrcCacheSize: isrcCache.size,
+    hifiInstance: activeInstance,
+    hifiHealthy: instanceHealthy,
+    sharedClientIdReady: !!SHARED_CLIENT_ID
+  });
 });
 
 app.post('/api/generate', async (req, res) => {
   const token = generateToken();
-  const meta  = { createdAt: new Date().toISOString(), searches: 0, streams: 0, lastUsed: null };
+  let soundcloudClientId = req.body?.soundcloudClientId || null;
+  if (soundcloudClientId && !/^[a-zA-Z0-9]{20,40}$/.test(soundcloudClientId)) {
+    return res.status(400).json({ error: 'Invalid SoundCloud client_id.' });
+  }
+  if (!soundcloudClientId) {
+    soundcloudClientId = await getOrFetchGlobalSoundCloudClientId();
+  }
+  const meta = {
+    createdAt: new Date().toISOString(),
+    searches: 0,
+    streams: 0,
+    lastUsed: null,
+    soundcloudClientId: soundcloudClientId || null
+  };
   tokens.set(token, meta);
   await rSet(`bc:token:${token}`, meta);
   res.json({ token, url: `${getBaseUrl(req)}/u/${token}/manifest.json` });
@@ -443,7 +860,8 @@ app.post('/api/update', async (req, res) => {
     tokens.set(oldToken, saved);
   }
   const newToken = generateToken();
-  const newMeta  = { ...tokens.get(oldToken), migratedAt: new Date().toISOString() };
+  const prevMeta = tokens.get(oldToken) || {};
+  const newMeta  = { ...prevMeta, migratedAt: new Date().toISOString() };
   tokens.set(newToken, newMeta);
   tokens.delete(oldToken);
   await rSet(`bc:token:${newToken}`, newMeta);
@@ -483,7 +901,7 @@ app.get('/api/export/:token', async (req, res) => {
     ...history.map(t => [esc(t.title),esc(t.artist),esc(t.album),t.isrc||'',t.format||'mp3',t.timestamp].join(','))
   ].join('\n');
   res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="bandcamp-eclipse-${token.slice(0,8)}.csv"`);
+  res.setHeader('Content-Disposition', `attachment; filename="bandcamp-hifi-${token.slice(0,8)}.csv"`);
   res.send(csv);
 });
 
@@ -493,47 +911,56 @@ app.get('/', (req, res) => {
   res.send(buildPage(getBaseUrl(req)));
 });
 
-// ─── 1. Manifest ─────────────────────────────────────────────────────────────
+// ─── Manifest ────────────────────────────────────────────────────────────────
 app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
-    id:          `com.yourname.bandcamp-mb.${req.params.token.slice(0, 8)}`,
-    name:        'Bandcamp',
+    id:          `com.yourname.bandcamp-mb-hifi.${req.params.token.slice(0, 8)}`,
+    name:        'Bandcamp + MB + HiFi/SC',
     version:     '1.0.0',
-    description: 'Bandcamp music with MusicBrainz ISRC enrichment - synced lyrics and rich artwork',
+    description: 'MusicBrainz + Bandcamp with HiFi → SoundCloud → Bandcamp streaming and ISRC enrichment',
     icon:        'https://s4.bcbits.com/img/bc_favicon.ico',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist']
   });
 });
 
-// ─── 2. Search ────────────────────────────────────────────────────────────────
+// ─── Search: MusicBrainz first, then Bandcamp ────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const { token } = req.params;
   const q = (req.query.q || '').trim();
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+
   const meta = tokens.get(token);
   meta.searches = (meta.searches || 0) + 1;
   meta.lastUsed = new Date().toISOString();
   if (meta.searches % 5 === 0) await rSet(`bc:token:${token}`, meta);
+
   try {
-    // Run all three searches + show list in parallel
-    const [allRes, artistsRes, showsList] = await Promise.allSettled([
+    const [
+      mbRecordings,
+      allRes,
+      artistsRes,
+      showsList
+    ] = await Promise.all([
+      mbSearchRecordings(q, 20),
       bcfetch.search.all({ query: q, page: 1 }),
       bcfetch.search.artistsAndLabels({ query: q, page: 1 }),
       bcfetch.show.list({})
     ]);
 
-    const items     = allRes.status === 'fulfilled' ? (allRes.value.items || []) : [];
-    const aItems    = artistsRes.status === 'fulfilled' ? (artistsRes.value.items || []) : [];
-    const shows     = showsList.status === 'fulfilled' ? (showsList.value || []) : [];
+    const mbTracks = mbRecordings.map(mapMbRecordingToTrack);
 
-    const rawTracks = items.filter(i => i.type === 'track').map(t => mapTrack(t));
-    const albums    = items.filter(i => i.type === 'album').map(mapAlbum);
+    const items  = allRes?.items || [];
+    const aItems = artistsRes?.items || [];
+    const shows  = showsList || [];
 
-    // Artists come from the dedicated artistsAndLabels search endpoint
-    const artists   = aItems.map(mapArtist);
+    const bcRawTracks = items
+      .filter(i => i.type === 'track')
+      .map(t => mapTrack(t));
 
-    // Playlists come from Bandcamp Daily shows filtered by query
+    const albums  = items.filter(i => i.type === 'album').map(mapAlbum);
+    const artists = aItems.map(mapArtist);
+
     const playlists = shows
       .filter(s => (s.title || '').toLowerCase().includes(q.toLowerCase()))
       .slice(0, 20)
@@ -545,8 +972,12 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
         creator:     'Bandcamp Daily'
       }));
 
-    const tracks = await enrichTracks(rawTracks);
+    const bcTracksEnriched = await enrichTracks(bcRawTracks);
+
+    const tracks = [...mbTracks, ...bcTracksEnriched];
+
     for (const t of tracks) await logTrack(token, t);
+
     res.json({ tracks, albums, artists, playlists });
   } catch (err) {
     console.error('[search]', err.message);
@@ -554,29 +985,119 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── 3. Stream ────────────────────────────────────────────────────────────────
+// ─── Stream: HiFi → SoundCloud → Bandcamp ────────────────────────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const { token } = req.params;
   const meta = tokens.get(token);
   meta.streams  = (meta.streams || 0) + 1;
   meta.lastUsed = new Date().toISOString();
-  const trackUrl = decodeId(req.params.id);
-  if (!trackUrl) return res.status(400).json({ error: 'Invalid track ID.' });
+  if (meta.streams % 5 === 0) await rSet(`bc:token:${token}`, meta);
+
+  const rawId = req.params.id || '';
+
   try {
+    // 1) MusicBrainz-based HiFi streams (using SC-style meta if you bind SC ids)
+    if (rawId.startsWith('mb:')) {
+      // You could look up SC meta via ISRC here and then call hifiFindBestTrack.
+      // For now we treat MB as catalog only; fall through to Bandcamp if you map it.
+      return res.status(404).json({ error: 'HiFi stream not wired for MB-only IDs yet.' });
+    }
+
+    // 2) SoundCloud stream (id is sc:<soundcloudTrackId>)
+    if (rawId.startsWith('sc:')) {
+      const scId = rawId.slice(3);
+      const clientId = meta.soundcloudClientId || (await getOrFetchGlobalSoundCloudClientId());
+      if (!clientId) {
+        return res.status(503).json({ error: 'No SoundCloud client_id available yet. Try again in a few seconds.' });
+      }
+
+      // optional: for HiFi we want SC meta to feed hifiFindBestTrack
+      let scTrack = null;
+      try {
+        scTrack = await scGet(clientId, `https://api-v2.soundcloud.com/tracks/soundcloud:tracks:${scId}`, {});
+      } catch (e) {
+        console.warn('[stream] sc lookup failed', e.message);
+      }
+      if (scTrack) rememberTrack(scTrack);
+      const metaParsed = scTrack ? parseArtistTitle(scTrack) : TRACK_CACHE.get(scId) || null;
+      const albumName =
+        scTrack && scTrack.publisher_metadata && scTrack.publisher_metadata.release_title
+          ? scTrack.publisher_metadata.release_title
+          : null;
+
+      // 2a) HiFi first
+      try {
+        const best = await hifiFindBestTrack(metaParsed, albumName);
+        if (best && best.id) {
+          const hifiId = best.id;
+          const qualities = ['LOSSLESS', 'HIGH', 'LOW'];
+          for (const ql of qualities) {
+            try {
+              const data    = await hifiGet('/track/', { id: hifiId, quality: ql });
+              const payload = (data && data.data) ? data.data : data;
+              if (payload && payload.manifest) {
+                const decoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
+                const url   = (decoded.urls && decoded.urls[0]) || null;
+                const codec = decoded.codecs || decoded.mimeType || '';
+                if (url) {
+                  const isFlac = codec &&
+                    (codec.indexOf('flac') !== -1 || codec.indexOf('audio/flac') !== -1);
+                  return res.json({
+                    url,
+                    format:  isFlac ? 'flac' : 'aac',
+                    quality: ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps')
+                  });
+                }
+              }
+            } catch (e) {
+              console.warn('[hifi]', e.message);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[hifi find]', e.message);
+      }
+
+      // 2b) SoundCloud fallback
+      const sc = await resolveSoundCloudStream(scId, clientId);
+      if (sc && sc.url) {
+        return res.json({
+          url: sc.url,
+          format: sc.format || 'mp3',
+          quality: sc.quality || 'standard'
+        });
+      }
+      return res.status(404).json({ error: 'SoundCloud stream not available.' });
+    }
+
+    // 3) Bandcamp fallback (id is bc:<base64url> or raw base64url)
+    let encoded = rawId;
+    if (rawId.startsWith('bc:')) {
+      encoded = rawId.slice(3);
+    }
+    const trackUrl = decodeId(encoded);
+    if (!trackUrl) return res.status(400).json({ error: 'Invalid track ID.' });
+
     const info = await bcfetch.track.getInfo({ trackUrl });
     let streamUrl = info?.streamUrl;
-    if (!streamUrl) return res.status(404).json({ error: 'Track is not streamable (album-only or purchase required).' });
+    if (!streamUrl) {
+      return res.status(404).json({ error: 'Track is not streamable (album-only or purchase required).' });
+    }
     const test = await bcfetch.stream.test(streamUrl);
-    if (!test.ok) streamUrl = await bcfetch.stream.refresh(streamUrl);
-    if (!streamUrl) return res.status(503).json({ error: 'Stream URL expired and could not be refreshed.' });
-    res.json({ url: streamUrl, format: 'mp3', quality: '128kbps' });
+    if (!test.ok) {
+      streamUrl = await bcfetch.stream.refresh(streamUrl);
+    }
+    if (!streamUrl) {
+      return res.status(503).json({ error: 'Stream URL expired and could not be refreshed.' });
+    }
+    return res.json({ url: streamUrl, format: 'mp3', quality: '128kbps' });
   } catch (err) {
     console.error('[stream]', err.message);
     res.status(500).json({ error: 'Stream resolution failed.' });
   }
 });
 
-// ─── 4. Album ─────────────────────────────────────────────────────────────────
+// ─── Album ────────────────────────────────────────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const albumUrl = decodeId(req.params.id);
   if (!albumUrl) return res.status(400).json({ error: 'Invalid album ID.' });
@@ -596,7 +1117,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── 5. Artist ────────────────────────────────────────────────────────────────
+// ─── Artist ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   const bandUrl = decodeId(req.params.id);
   if (!bandUrl) return res.status(400).json({ error: 'Invalid artist ID.' });
@@ -613,7 +1134,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         const albumInfo = await bcfetch.album.getInfo({ albumUrl: latest.url });
         const rawTracks = (albumInfo.tracks || []).slice(0, 10).map(t => mapTrack(t, info.name));
         topTracks = await enrichTracks(rawTracks, 3000);
-      } catch { }
+      } catch {}
     }
     res.json({
       id: req.params.id, name: info.name, artworkURL: info.imageUrl,
@@ -625,7 +1146,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── 6. Playlist (Bandcamp Daily) ────────────────────────────────────────────
+// ─── Playlist (Bandcamp Daily) ───────────────────────────────────────────────
 app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
   const showUrl = decodeId(req.params.id);
   if (!showUrl) return res.status(400).json({ error: 'Invalid playlist ID.' });
@@ -644,6 +1165,6 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Bandcamp x MusicBrainz Eclipse addon -> port ${PORT}`);
+  console.log(`Bandcamp + MusicBrainz + HiFi/SC addon -> port ${PORT}`);
   console.log(`Redis: ${redis ? 'enabled' : 'disabled (set REDIS_URL to enable)'}`);
 });
