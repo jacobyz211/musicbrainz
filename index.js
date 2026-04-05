@@ -772,49 +772,82 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
       });
     }
 
-    // SOUNDCLOUD ARTIST
-    if (prefix === 'scart') {
-      const artist = await scGet(
-        cid,
-        `https://api-v2.soundcloud.com/users/${artistId}`
-      );
-      const tracksRes = await scGet(
-        cid,
-        `https://api-v2.soundcloud.com/users/${artistId}/tracks`,
-        { limit: 25, linked_partitioning: 1 }
-      );
+    // inside app.get('/u/:token/artist/:id', ...) keep YTM part as‑is and replace only the scart block:
 
-      const topTracks = (tracksRes.collection || [])
-        .filter(t => t && isFullyPlayable(t))
-        .map(t => {
-          rememberTrack(t);
-          const m = parseArtistTitle(t);
-          return {
-            id:       'sc:' + String(t.id),
-            title:    m.title || 'Unknown',
-            artist:   m.artist || artist.username || 'Unknown',
-            duration: t.duration ? Math.floor(t.duration / 1000) : null
-          };
-        });
+    if (prefix === 'scart') {
+      let artist;
+
+      try {
+        artist = await scGet(
+          cid,
+          `https://api-v2.soundcloud.com/users/${artistId}`
+        );
+      } catch (e) {
+        console.warn('[artist] SC user 403/err, will fall back to local search:', e.message);
+      }
+
+      let topTracks = [];
+
+      if (artist) {
+        // Primary path: real SC API call (when not 403)
+        try {
+          const tracksRes = await scGet(
+            cid,
+            `https://api-v2.soundcloud.com/users/${artistId}/tracks`,
+            { limit: 25, linked_partitioning: 1 }
+          );
+
+          topTracks = (tracksRes.collection || [])
+            .filter(t => t && isFullyPlayable(t))
+            .map(t => {
+              rememberTrack(t);
+              const m = parseArtistTitle(t);
+              return {
+                id:       'sc:' + String(t.id),
+                title:    m.title || 'Unknown',
+                artist:   m.artist || artist.username || 'Unknown',
+                duration: t.duration ? Math.floor(t.duration / 1000) : null
+              };
+            });
+        } catch (e2) {
+          console.warn('[artist] SC tracks 403/err, will fall back to local search:', e2.message);
+        }
+      }
+
+      // Fallback if SC user or tracks 403/failed: query our own /search for this artist
+      if ((!artist || topTracks.length === 0) && rawId) {
+        try {
+          const baseUrl = getBaseUrl(req);
+          const name = artist?.username || rawId; // best guess
+          const r = await axios.get(
+            `${baseUrl}/u/${req.params.token}/search`,
+            { params: { q: name }, timeout: 6000 }
+          );
+
+          const body = r.data || {};
+          const fromTracks = (body.tracks || []).filter(t => t && t.id && String(t.id).startsWith('sc:'));
+
+          topTracks = fromTracks.slice(0, 25).map(t => ({
+            id:       t.id,
+            title:    t.title,
+            artist:   t.artist || (artist && artist.username) || 'Unknown',
+            duration: t.duration || null
+          }));
+        } catch (e3) {
+          console.warn('[artist] local /search fallback failed:', e3.message);
+        }
+      }
 
       return res.json({
         id: rawId,
-        name: artist.username || 'Unknown',
-        artworkURL: artworkUrl(artist.avatar_url),
-        bio: artist.description || '',
-        genres: artist.genre ? [artist.genre] : [],
+        name: (artist && artist.username) || 'Unknown',
+        artworkURL: artist ? artworkUrl(artist.avatar_url) : null,
+        bio: artist ? (artist.description || '') : '',
+        genres: artist && artist.genre ? [artist.genre] : [],
         topTracks,
-        albums: []
+        albums: [] // SC albums still empty, which Eclipse handles fine
       });
     }
-
-    // If we still couldn't classify, return a clear error
-    return res.status(400).json({ error: 'Unsupported or malformed artist id' });
-  } catch (e) {
-    console.error('[artist] error', e.message);
-    res.status(500).json({ error: 'Artist lookup failed.' });
-  }
-});
 
 // ─── Album details (SC + YTM) ───────────────────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
