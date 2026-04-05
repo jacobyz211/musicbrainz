@@ -11,7 +11,7 @@ const {
   searchArtists,
   getArtist,
   listMusicsFromAlbum
-} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62]
+} = require('node-youtube-music'); // still imported, but search is now optional[web:62]
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -103,7 +103,8 @@ async function redisSave(token, entry) {
       clientId:  entry.clientId,
       createdAt: entry.createdAt,
       lastUsed:  entry.lastUsed,
-      reqCount:  entry.reqCount
+      reqCount:  entry.reqCount,
+      ytApiKey:  entry.ytApiKey || null     // store YouTube API key too
     }));
   } catch (e) {
     console.error('[Redis] Save failed: ' + e.message);
@@ -148,7 +149,8 @@ async function getTokenEntry(token) {
     createdAt: saved.createdAt,
     lastUsed:  saved.lastUsed,
     reqCount:  saved.reqCount,
-    rateWin:   []
+    rateWin:   [],
+    ytApiKey:  saved.ytApiKey || null   // per-token YouTube API key
   };
   TOKEN_CACHE.set(token, entry);
   return entry;
@@ -443,7 +445,139 @@ async function hifiFindBestTrack(meta, albumName) {
   return null;
 }
 
-// ─── Simple config page (short version) ─────────────────────────────────────
+// ─── YouTube Data API helpers (search only, no streaming) ───────────────────
+const SOURCE_TIMEOUT_MS = 10000;
+
+async function fetchYT(url, params) {
+  const r = await axios.get(url, {
+    params,
+    timeout: SOURCE_TIMEOUT_MS,
+    headers: { 'User-Agent': UA, 'Accept': 'application/json' }
+  });
+  return r.data;
+}
+
+function parseISODuration(iso) {
+  const m = String(iso || '').match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return null;
+  const secs = (parseInt(m[1]||0)*3600) + (parseInt(m[2]||0)*60) + parseInt(m[3]||0);
+  return secs > 0 ? secs : null;
+}
+
+function pickArt(snippet) {
+  return (snippet && (snippet.thumbnails?.high?.url || snippet.thumbnails?.medium?.url || snippet.thumbnails?.default?.url)) || null;
+}
+
+function mapYoutubeToTrack(videoId, snippet, contentDetails) {
+  return {
+    id: 'ytvid_' + videoId,
+    title: cleanText(snippet.title || 'YouTube Video'),
+    artist: cleanText(snippet.channelTitle || 'YouTube'),
+    album: 'YouTube',
+    duration: parseISODuration(contentDetails?.duration),
+    artworkURL: pickArt(snippet),
+    format: 'm4a',
+    sourceURL: 'https://www.youtube.com/watch?v=' + videoId
+  };
+}
+
+function scoreYoutubeVideo(query, title, channel, desc) {
+  const q = cleanText(query).toLowerCase();
+  const t = cleanText(title).toLowerCase();
+  const c = cleanText(channel).toLowerCase();
+  const d = cleanText(desc).toLowerCase();
+  if (!q || !t) return 0;
+  let score = 0;
+  if (t === q) score += 150;
+  else if (t.startsWith(q)) score += 60;
+  else if (t.includes(q)) score += 35;
+  if (c.includes(q)) score += 15;
+  if (/official audio|official video|audio|lyrics?|visualizer|topic/.test(t)) score += 20;
+  if (/full album|mix|compilation|reaction|review|interview|podcast|trailer/.test(t + ' ' + d)) score -= 40;
+  return score;
+}
+
+async function youtubeSearch(apiKey, q) {
+  if (!apiKey) return { tracks: [], albums: [], artists: [], playlists: [] };
+
+  const searchData = await fetchYT('https://www.googleapis.com/youtube/v3/search', {
+    part: 'snippet', q, type: 'video', maxResults: 20, safeSearch: 'none', key: apiKey
+  });
+
+  const items = Array.isArray(searchData.items) ? searchData.items : [];
+  const ids = items.map(x => x.id?.videoId).filter(Boolean).join(',');
+
+  let detailMap = new Map();
+  if (ids) {
+    try {
+      const detailData = await fetchYT('https://www.googleapis.com/youtube/v3/videos', {
+        part: 'contentDetails,snippet', id: ids, key: apiKey
+      });
+      (detailData.items || []).forEach(d => detailMap.set(String(d.id), d));
+    } catch(e) {}
+  }
+
+  const ranked = items.map(item => {
+    const vid = String(item.id?.videoId || '');
+    const detail = detailMap.get(vid);
+    const s = item.snippet || {};
+    return {
+      vid,
+      snippet: detail?.snippet || s,
+      detail,
+      score: scoreYoutubeVideo(q, s.title||'', s.channelTitle||'', s.description||'')
+    };
+  }).filter(x => x.score >= 20).sort((a, b) => b.score - a.score).slice(0, 12);
+
+  const tracks = ranked.map(x => mapYoutubeToTrack(x.vid, x.snippet, x.detail?.contentDetails));
+
+  const albums = ranked.slice(0, 8).map(x => ({
+    id: 'ytalbum_' + x.vid,
+    title: cleanText(x.snippet.title || 'YouTube Video'),
+    artist: cleanText(x.snippet.channelTitle || 'YouTube'),
+    artworkURL: pickArt(x.snippet),
+    trackCount: 1,
+    year: String(x.snippet.publishedAt || '').slice(0, 4) || null
+  }));
+
+  const seenArtists = new Set(), artists = [];
+  const seenPlaylists = new Set(), playlists = [];
+  for (const x of ranked) {
+    const cid = String(x.snippet.channelId || '');
+    const cname = cleanText(x.snippet.channelTitle || 'YouTube');
+    if (cid && !seenArtists.has(cid)) {
+      seenArtists.add(cid);
+      artists.push({ id: 'ytartist_' + cid, name: cname, artworkURL: pickArt(x.snippet), genres: [] });
+    }
+    if (cid && !seenPlaylists.has(cid)) {
+      seenPlaylists.add(cid);
+      playlists.push({ id: 'ytplaylist_' + cid, title: cname + ' Picks', creator: cname, artworkURL: pickArt(x.snippet), trackCount: null });
+    }
+  }
+
+  return { tracks, albums, artists: artists.slice(0, 6), playlists: playlists.slice(0, 6) };
+}
+
+async function getYoutubeVideo(apiKey, videoId) {
+  try {
+    const data = await fetchYT('https://www.googleapis.com/youtube/v3/videos', {
+      part: 'contentDetails,snippet', id: videoId, key: apiKey
+    });
+    const item = Array.isArray(data.items) ? data.items[0] : null;
+    return item || null;
+  } catch(e) { return null; }
+}
+
+async function getYoutubeChannelVideos(apiKey, channelId) {
+  try {
+    const data = await fetchYT('https://www.googleapis.com/youtube/v3/search', {
+      part: 'snippet', channelId, type: 'video', maxResults: 12, order: 'relevance', key: apiKey
+    });
+    return Array.isArray(data.items) ? data.items : [];
+  } catch(e) { return []; }
+}
+
+// ─── Simple config page (add ytApiKey input) ────────────────────────────────
 function buildConfigPage(baseUrl) {
   let h = '';
   h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
@@ -464,10 +598,12 @@ function buildConfigPage(baseUrl) {
   h += '.label-sm{font-size:11px;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em}</style></head><body>';
   h += '<div class="card">';
   h += '<h1>All-in-One Music Addon</h1>';
-  h += '<p>Search using SoundCloud + YouTube Music, and play through your configured audio sources. Each URL below is unique per user.</p>';
+  h += '<p>Search using SoundCloud + YouTube Music + optional YouTube Data API. Each URL below is unique per user.</p>';
   h += '<div class="lbl">SoundCloud client_id <span style="text-transform:none;font-weight:400;color:#4b5563">(optional)</span></div>';
   h += '<input id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
-  h += '<p class="small">You can paste your own client_id from SoundCloud network requests, or rely on the shared one.</p>';
+  h += '<div class="lbl">YouTube API key <span style="text-transform:none;font-weight:400;color:#4b5563">(optional, for YouTube search)</span></div>';
+  h += '<input id="ytApiKey" placeholder="Paste your YouTube Data API v3 key">';
+  h += '<p class="small">You can paste your own SoundCloud client_id and YouTube API key, or rely only on SoundCloud.</p>';
   h += '<button class="primary" id="genBtn" onclick="generate()">Generate my addon URL</button>';
   h += '<div class="box" id="genBox"><div class="label-sm">Manifest URL (paste into Eclipse)</div><code id="genUrl"></code></div>';
   h += '<div class="lbl">Existing addon URL</div>';
@@ -480,16 +616,16 @@ function buildConfigPage(baseUrl) {
   h += '</div>';
   h += '<script>';
   h += 'let currentToken="";';
-  h += 'function generate(){const btn=document.getElementById("genBtn");const cid=document.getElementById("clientId").value.trim()||null;';
+  h += 'function generate(){const btn=document.getElementById("genBtn");const cid=document.getElementById("clientId").value.trim()||null;const yt=document.getElementById("ytApiKey").value.trim()||null;';
   h += 'btn.disabled=true;btn.textContent="Generating...";';
-  h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid})})';
+  h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid,ytApiKey:yt})})';
   h += '.then(r=>r.json()).then(d=>{if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate my addon URL";return;}';
   h += 'currentToken=d.token;document.getElementById("genUrl").textContent=d.manifestUrl;';
   h += 'document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";})';
   h += '.catch(e=>{alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate my addon URL";});}';
-  h += 'function refreshUrl(){const btn=document.getElementById("refBtn");const eu=document.getElementById("existingUrl").value.trim();const cid=document.getElementById("clientId").value.trim()||null;';
+  h += 'function refreshUrl(){const btn=document.getElementById("refBtn");const eu=document.getElementById("existingUrl").value.trim();const cid=document.getElementById("clientId").value.trim()||null;const yt=document.getElementById("ytApiKey").value.trim()||null;';
   h += 'if(!eu){alert("Paste an existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";';
-  h += 'fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid})})';
+  h += 'fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid,ytApiKey:yt})})';
   h += '.then(r=>r.json()).then(d=>{if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh existing URL";return;}';
   h += 'currentToken=d.token;document.getElementById("refUrl").textContent=d.manifestUrl;';
   h += 'document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh existing URL";})';
@@ -511,12 +647,18 @@ app.post('/generate', async (req, res) => {
   if (bucket.count >= MAX_TOKENS_PER_IP) {
     return res.status(429).json({ error: 'Too many tokens today from this IP.' });
   }
-  const cid = (req.body && req.body.clientId) ? String(req.body.clientId).trim() : null;
+  const cid      = (req.body && req.body.clientId) ? String(req.body.clientId).trim() : null;
+  const ytApiKey = (req.body && req.body.ytApiKey) ? String(req.body.ytApiKey).trim() : null;
+
   if (cid && !/^[a-zA-Z0-9]{20,40}$/.test(cid)) {
     return res.status(400).json({ error: 'Invalid client_id.' });
   }
+  if (ytApiKey && !/^[A-Za-z0-9_\-]{25,60}$/.test(ytApiKey)) {
+    return res.status(400).json({ error: 'Invalid YouTube API key format.' });
+  }
+
   const token = generateToken();
-  const entry = { clientId: cid || null, createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [] };
+  const entry = { clientId: cid || null, ytApiKey: ytApiKey || null, createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [] };
   TOKEN_CACHE.set(token, entry);
   await redisSave(token, entry);
   bucket.count++;
@@ -526,6 +668,8 @@ app.post('/generate', async (req, res) => {
 app.post('/refresh', async (req, res) => {
   const raw = (req.body && req.body.existingUrl) ? String(req.body.existingUrl).trim() : '';
   const cid = (req.body && req.body.clientId) ? String(req.body.clientId).trim() : null;
+  const ytApiKey = (req.body && req.body.ytApiKey) ? String(req.body.ytApiKey).trim() : null;
+
   let token = raw;
   const m   = raw.match(/\/u\/([a-f0-9]{28})\//);
   if (m) token = m[1];
@@ -534,14 +678,22 @@ app.post('/refresh', async (req, res) => {
   }
   const entry = await getTokenEntry(token);
   if (!entry) return res.status(404).json({ error: 'URL not found. Generate a new one.' });
+
   if (cid) {
     if (!/^[a-zA-Z0-9]{20,40}$/.test(cid)) {
       return res.status(400).json({ error: 'Invalid client_id.' });
     }
     entry.clientId = cid;
-    TOKEN_CACHE.set(token, entry);
-    await redisSave(token, entry);
   }
+  if (ytApiKey) {
+    if (!/^[A-Za-z0-9_\-]{25,60}$/.test(ytApiKey)) {
+      return res.status(400).json({ error: 'Invalid YouTube API key format.' });
+    }
+    entry.ytApiKey = ytApiKey;
+  }
+  TOKEN_CACHE.set(token, entry);
+  await redisSave(token, entry);
+
   res.json({ token, manifestUrl: getBaseUrl(req) + '/u/' + token + '/manifest.json', refreshed: true });
 });
 
@@ -563,14 +715,14 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
     id:          'com.eclipse.allinone.' + req.params.token.slice(0, 8),
     name:        'All-in-One',
     version:     '1.0.0',
-    description: 'Search using SoundCloud + YouTube Music',
+    description: 'Search using SoundCloud + YouTube (Music/Data API).',
     icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRmBwAaJXf-E_3leRupHphGAs7ZH51og_IkfAgvW7vfgA&s=10',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist', 'file']
   });
 });
 
-// ─── Search: SC + YTM for tracks, albums, artists, playlists ────────────────
+// ─── Search: SC + YTM + YouTube Data API ────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -579,7 +731,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud: tracks + playlists + users (for artists)
+    // SoundCloud: tracks + playlists + users
     const results = await Promise.all([
       scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',    { q, limit: 40, offset: 0, linked_partitioning: 1 }),
       scGet(cid, 'https://api-v2.soundcloud.com/search/playlists', { q, limit: 15, offset: 0 }),
@@ -592,7 +744,6 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 
     const allPl = plRes.collection || [];
 
-    // SC tracks: only fully playable (no previews/SNIP)
     const scTracks = (trackRes.collection || [])
       .filter(t => t && isFullyPlayable(t))
       .map(t => {
@@ -638,7 +789,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       genres:     u.genre ? [u.genre] : []
     }));
 
-      // YouTube Music: tracks, artists, albums, playlists
+    // YouTube Music (node-youtube-music) – may 404 from Render; keep but log
     let ytmTracks = [];
     let ytmArtists = [];
     let ytmAlbums = [];
@@ -699,12 +850,25 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       console.warn('[ytm] searchPlaylists failed:', e.message);
     }
 
-    // Final combined response
+    // YouTube Data API search (official, uses ytApiKey)
+    let ytTracks = [], ytAlbums = [], ytArtists = [], ytPlaylists = [];
+    if (req.tokenEntry.ytApiKey) {
+      try {
+        const ytData = await youtubeSearch(req.tokenEntry.ytApiKey, q);
+        ytTracks    = ytData.tracks    || [];
+        ytAlbums    = ytData.albums    || [];
+        ytArtists   = ytData.artists   || [];
+        ytPlaylists = ytData.playlists || [];
+      } catch (e) {
+        console.warn('[ytapi] search failed:', e.message);
+      }
+    }
+
     return res.json({
-      tracks:    scTracks.concat(ytmTracks),
-      albums:    scAlbums.concat(ytmAlbums),
-      artists:   scArtists.concat(ytmArtists),
-      playlists: scPlaylists.concat(ytmPlaylists)
+      tracks:    scTracks.concat(ytmTracks).concat(ytTracks),
+      albums:    scAlbums.concat(ytmAlbums).concat(ytAlbums),
+      artists:   scArtists.concat(ytmArtists).concat(ytArtists),
+      playlists: scPlaylists.concat(ytmPlaylists).concat(ytPlaylists)
     });
   } catch (e) {
     console.error('[search] error', e.message);
@@ -712,11 +876,10 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Artist details (SC + YTM) ──────────────────────────────────────────────
+// ─── Artist details (SC + YTM + YouTube API) ────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   let rawId = req.params.id || '';
 
-  // Support both "ytart:XYZ"/"scart:123" and bare IDs from search
   let prefix = null;
   let artistId = null;
 
@@ -726,6 +889,9 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   } else if (rawId.startsWith('scart:')) {
     prefix   = 'scart';
     artistId = rawId.slice('scart:'.length);
+  } else if (rawId.startsWith('ytartist_')) {
+    prefix   = 'ytartist';
+    artistId = rawId.slice('ytartist_'.length);
   } else if (/^[a-zA-Z0-9_-]{6,}$/.test(rawId)) {
     prefix   = 'ytart';
     artistId = rawId;
@@ -740,10 +906,9 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
   try {
-    // YOUTUBE MUSIC ARTIST
+    // YTM artist
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // may or may not include albums[web:62]
-
+      const artist = await getArtist(artistId);[web:62]
       const name = artist.name || 'Artist';
       const artworkURL =
         artist.thumbnails && artist.thumbnails.length
@@ -768,10 +933,9 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         year:       a.year || undefined
       }));
 
-      // Fallback: if getArtist() doesn't give albums, try listing them explicitly
       if (!albums.length && artistId) {
         try {
-          const { listAlbumsFromArtist } = require('node-youtube-music'); // same package[web:74]
+          const { listAlbumsFromArtist } = require('node-youtube-music');[web:74]
           const albList = await listAlbumsFromArtist(artistId);
           albums = (albList || []).map(a => ({
             id:         'ytalb:' + a.albumId,
@@ -797,7 +961,34 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
       });
     }
 
-    // SOUNDCLOUD ARTIST
+    // YouTube Data API artist (channel)
+    if (prefix === 'ytartist' && req.tokenEntry.ytApiKey) {
+      const channelId = artistId;
+      const items = await getYoutubeChannelVideos(req.tokenEntry.ytApiKey, channelId);
+      if (!items.length) return res.status(404).json({ error: 'No videos found for this channel.' });
+      const topTracks = items.slice(0, 8).map(item =>
+        mapYoutubeToTrack(String(item.id?.videoId || ''), item.snippet || {}, null)
+      );
+      const albums = items.slice(0, 8).map(item => ({
+        id: 'ytalbum_' + String(item.id?.videoId || ''),
+        title: cleanText(item.snippet?.title || ''),
+        artist: cleanText(item.snippet?.channelTitle || ''),
+        artworkURL: pickArt(item.snippet),
+        trackCount: 1,
+        year: null
+      }));
+      return res.json({
+        id: rawId,
+        name: cleanText(items[0].snippet?.channelTitle || 'YouTube'),
+        artworkURL: pickArt(items[0].snippet),
+        bio: null,
+        genres: [],
+        topTracks,
+        albums
+      });
+    }
+
+    // SC artist (unchanged)
     if (prefix === 'scart') {
       let artist;
       try {
@@ -836,7 +1027,6 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         }
       }
 
-      // Fallback if SC user or tracks 403/failed: query our own /search for this artist
       if ((!artist || topTracks.length === 0) && rawId) {
         try {
           const baseUrl = getBaseUrl(req);
@@ -862,7 +1052,6 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         }
       }
 
-      // Build albums for SC artist from our own search results (reliable)
       let albums = [];
       try {
         const baseUrl = getBaseUrl(req);
@@ -907,7 +1096,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Album details (SC + YTM) ───────────────────────────────────────────────
+// ─── Album details (SC + YTM + YouTube API) ─────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const rawId = req.params.id || '';
   const [prefix, albumId] = rawId.split(':', 2);
@@ -917,7 +1106,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
 
   try {
     if (prefix === 'ytalb') {
-      const tracksData = await listMusicsFromAlbum(albumId); // [web:62]
+      const tracksData = await listMusicsFromAlbum(albumId);[web:62]
       const tracks = (tracksData || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
@@ -936,6 +1125,23 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
         description: '',
         trackCount: tracks.length,
         tracks
+      });
+    }
+
+    if (rawId.startsWith('ytalbum_') && req.tokenEntry.ytApiKey) {
+      const videoId = rawId.replace('ytalbum_', '');
+      const detail = await getYoutubeVideo(req.tokenEntry.ytApiKey, videoId);
+      if (!detail) return res.status(404).json({ error: 'Album not found.' });
+      const track = mapYoutubeToTrack(videoId, detail.snippet || {}, detail.contentDetails);
+      return res.json({
+        id: rawId,
+        title: track.title,
+        artist: track.artist,
+        artworkURL: track.artworkURL,
+        year: String(detail.snippet?.publishedAt || '').slice(0, 4) || null,
+        description: cleanText(detail.snippet?.description || '').slice(0, 700),
+        trackCount: 1,
+        tracks: [track]
       });
     }
 
@@ -973,7 +1179,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Playlist details (SC + YTM) ────────────────────────────────────────────
+// ─── Playlist details (SC + YouTube API) ────────────────────────────────────
 app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
   const rawId = req.params.id || '';
   const [prefix, playlistId] = rawId.split(':', 2);
@@ -1007,7 +1213,23 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
       });
     }
 
-    // For YTM playlists, Eclipse will just search by name or you can add listMusicsFromPlaylist
+    if (rawId.startsWith('ytplaylist_') && req.tokenEntry.ytApiKey) {
+      const channelId = rawId.replace('ytplaylist_', '');
+      const items = await getYoutubeChannelVideos(req.tokenEntry.ytApiKey, channelId);
+      if (!items.length) return res.status(404).json({ error: 'No videos found.' });
+      const tracks = items.slice(0, 12).map(item =>
+        mapYoutubeToTrack(String(item.id?.videoId || ''), item.snippet || {}, null)
+      );
+      return res.json({
+        id: rawId,
+        title: cleanText(items[0].snippet?.channelTitle || 'YouTube') + ' Picks',
+        description: 'Top results from this YouTube channel.',
+        artworkURL: pickArt(items[0].snippet),
+        creator: cleanText(items[0].snippet?.channelTitle || 'YouTube'),
+        tracks
+      });
+    }
+
     return res.status(400).json({ error: 'Unsupported playlist id' });
   } catch (e) {
     console.error('[playlist] error', e.message);
@@ -1015,7 +1237,7 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Stream: HiFi first, SoundCloud fallback ────────────────────────────────
+// ─── Stream: HiFi first, SoundCloud fallback (unchanged, no YT streaming) ──
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const cid   = effectiveCid(req.tokenEntry);
   const rawId = req.params.id || '';
@@ -1116,7 +1338,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     }
   }
 
-  // For YT or unknown prefixes we currently have no direct stream
+  // For YouTube IDs we do not stream (search only)
   return res.status(404).json({ error: 'No stream found.' });
 });
 
@@ -1159,5 +1381,5 @@ app.get('/u/:token/export.csv', async (req, res) => {
 
 // ─── Start server ───────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('Addon running on http://localhost:' + PORT);
+  console.log('All-in-One Music Addon on http://localhost:' + PORT);
 });
