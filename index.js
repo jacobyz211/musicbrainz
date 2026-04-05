@@ -712,8 +712,9 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
   try {
+    // YOUTUBE MUSIC ARTIST
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // same as before [web:62]
+      const artist = await getArtist(artistId); // returns songs + albums etc. [web:62]
 
       const name = artist.name || 'Artist';
       const artworkURL =
@@ -721,14 +722,15 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
           ? artist.thumbnails[0].url
           : null;
 
-      // keep your existing mapping, just name it tracks
-      const tracks = (artist.songs || []).map(m => ({
+      // Eclipse expects "topTracks" with id/title/artist/duration/streamURL? [web:155]
+      const topTracks = (artist.songs || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
         artist:   name,
         duration: m.duration && m.duration.totalSeconds
           ? m.duration.totalSeconds
           : null
+        // streamURL is optional; Eclipse will call /stream/{id} for yt:… ids
       }));
 
       const albums = (artist.albums || []).map(a => ({
@@ -740,18 +742,18 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         year:       a.year || undefined
       }));
 
-      // IMPORTANT: use "tracks" (like Claudochrome), not "topTracks"
       return res.json({
         id: rawId,
         name,
         artworkURL,
         bio: '',
         genres: [],
-        tracks,
-        albums
+        topTracks,  // IMPORTANT: this key name
+        albums      // and this key name
       });
     }
 
+    // SOUNDCLOUD ARTIST
     if (prefix === 'scart') {
       const artist = await scGet(
         cid,
@@ -763,7 +765,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         { limit: 25, linked_partitioning: 1 }
       );
 
-      const tracks = (tracksRes.collection || [])
+      const topTracks = (tracksRes.collection || [])
         .filter(t => t && isFullyPlayable(t))
         .map(t => {
           rememberTrack(t);
@@ -782,8 +784,8 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL: artworkUrl(artist.avatar_url),
         bio: artist.description || '',
         genres: artist.genre ? [artist.genre] : [],
-        tracks,   // again, "tracks" not "topTracks"
-        albums: []
+        topTracks, // again: "topTracks" not "tracks"
+        albums: [] // SC: no album grouping yet, that's fine
       });
     }
 
