@@ -935,7 +935,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
 
       if (!albums.length && artistId) {
         try {
-          const { listAlbumsFromArtist } = require('node-youtube-music');[web:74]
+          const { listAlbumsFromArtist } = require('node-youtube-music');
           const albList = await listAlbumsFromArtist(artistId);
           albums = (albList || []).map(a => ({
             id:         'ytalb:' + a.albumId,
