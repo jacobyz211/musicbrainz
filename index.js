@@ -850,26 +850,26 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       console.warn('[ytm] searchPlaylists failed:', e.message);
     }
 
-    // YouTube Data API search (official, uses ytApiKey)
-    let ytTracks = [], ytAlbums = [], ytArtists = [], ytPlaylists = [];
-    if (req.tokenEntry.ytApiKey) {
-      try {
-        const ytData = await youtubeSearch(req.tokenEntry.ytApiKey, q);
-        ytTracks    = ytData.tracks    || [];
-        ytAlbums    = ytData.albums    || [];
-        ytArtists   = ytData.artists   || [];
-        ytPlaylists = ytData.playlists || [];
-      } catch (e) {
-        console.warn('[ytapi] search failed:', e.message);
-      }
-    }
-
+    // YouTube Data API search (from ytApiKey)
+let ytTracks = [], ytAlbums = [], ytArtists = [], ytPlaylists = [];
+if (req.tokenEntry.ytApiKey) {
+  try {
+    const ytData = await youtubeSearch(req.tokenEntry.ytApiKey, q);
+    ytTracks    = ytData.tracks    || [];
+    ytAlbums    = ytData.albums    || [];
+    ytArtists   = ytData.artists   || [];
+    ytPlaylists = ytData.playlists || [];
+  } catch (e) {
+    console.warn('[ytapi] search failed:', e.message);
+  }
+}
+  
     return res.json({
-      tracks:    scTracks.concat(ytmTracks).concat(ytTracks),
-      albums:    scAlbums.concat(ytmAlbums).concat(ytAlbums),
-      artists:   scArtists.concat(ytmArtists).concat(ytArtists),
-      playlists: scPlaylists.concat(ytmPlaylists).concat(ytPlaylists)
-    });
+    tracks:    scTracks.concat(ytmTracks).concat(ytTracks),
+    albums:    scAlbums.concat(ytmAlbums).concat(ytAlbums),
+    artists:   scArtists.concat(ytmArtists).concat(ytArtists),
+    playlists: scPlaylists.concat(ytmPlaylists).concat(ytPlaylists)
+   });
   } catch (e) {
     console.error('[search] error', e.message);
     return res.status(500).json({ error: 'Search failed.' });
