@@ -638,66 +638,79 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       genres:     u.genre ? [u.genre] : []
     }));
 
-    // YouTube Music: tracks, artists, albums, playlists
-let ytmTracks = [];
-let ytmArtists = [];
-let ytmAlbums = [];
-let ytmPlaylists = [];
+      // YouTube Music: tracks, artists, albums, playlists
+    let ytmTracks = [];
+    let ytmArtists = [];
+    let ytmAlbums = [];
+    let ytmPlaylists = [];
 
-try {
-  const ytmRes = await searchMusics(q);
-  ytmTracks = (ytmRes || []).map(m => ({
-    id:       'yt:' + m.youtubeId,
-    title:    m.title,
-    artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
-    album:    m.album && m.album.name ? m.album.name : '',
-    duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null,
-    artworkURL: m.thumbnailUrl || undefined,
-    format: 'aac'
-  }));
-} catch (e) {
-  console.warn('[ytm] searchMusics failed:', e.message);
-}
+    try {
+      const ytmRes = await searchMusics(q);
+      ytmTracks = (ytmRes || []).map(m => ({
+        id:       'yt:' + m.youtubeId,
+        title:    m.title,
+        artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
+        album:    m.album && m.album.name ? m.album.name : '',
+        duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null,
+        artworkURL: m.thumbnailUrl || undefined,
+        format: 'aac'
+      }));
+    } catch (e) {
+      console.warn('[ytm] searchMusics failed:', e.message);
+    }
 
-try {
-  const resArtists = await searchArtists(q);
-  ytmArtists = (resArtists || []).map(a => ({
-    id:         'ytart:' + a.artistId,
-    name:       a.name,
-    artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
-    genres:     []
-  }));
-} catch (e) {
-  console.warn('[ytm] searchArtists failed:', e.message);
-}
+    try {
+      const resArtists = await searchArtists(q);
+      ytmArtists = (resArtists || []).map(a => ({
+        id:         'ytart:' + a.artistId,
+        name:       a.name,
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
+        genres:     []
+      }));
+    } catch (e) {
+      console.warn('[ytm] searchArtists failed:', e.message);
+    }
 
-try {
-  const resAlbums = await searchAlbums(q);
-  ytmAlbums = (resAlbums || []).map(a => ({
-    id:         'ytalb:' + a.albumId,
-    title:      a.name,
-    artist:     a.artist && a.artist.name ? a.artist.name : '',
-    artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
-    trackCount: null,
-    year:       a.year || undefined
-  }));
-} catch (e) {
-  console.warn('[ytm] searchAlbums failed:', e.message);
-}
+    try {
+      const resAlbums = await searchAlbums(q);
+      ytmAlbums = (resAlbums || []).map(a => ({
+        id:         'ytalb:' + a.albumId,
+        title:      a.name,
+        artist:     a.artist && a.artist.name ? a.artist.name : '',
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
+        trackCount: null,
+        year:       a.year || undefined
+      }));
+    } catch (e) {
+      console.warn('[ytm] searchAlbums failed:', e.message);
+    }
 
-try {
-  const resPlaylists = await searchPlaylists(q);
-  ytmPlaylists = (resPlaylists || []).map(p => ({
-    id:         'ytpl:' + p.playlistId,
-    title:      p.title,
-    description: '',
-    artworkURL: p.thumbnails && p.thumbnails.length ? p.thumbnails[0].url : null,
-    creator:    '',
-    trackCount: null
-  }));
-} catch (e) {
-  console.warn('[ytm] searchPlaylists failed:', e.message);
-}
+    try {
+      const resPlaylists = await searchPlaylists(q);
+      ytmPlaylists = (resPlaylists || []).map(p => ({
+        id:         'ytpl:' + p.playlistId,
+        title:      p.title,
+        description: '',
+        artworkURL: p.thumbnails && p.thumbnails.length ? p.thumbnails[0].url : null,
+        creator:    '',
+        trackCount: null
+      }));
+    } catch (e) {
+      console.warn('[ytm] searchPlaylists failed:', e.message);
+    }
+
+    // Final combined response
+    return res.json({
+      tracks:    scTracks.concat(ytmTracks),
+      albums:    scAlbums.concat(ytmAlbums),
+      artists:   scArtists.concat(ytmArtists),
+      playlists: scPlaylists.concat(ytmPlaylists)
+    });
+  } catch (e) {
+    console.error('[search] error', e.message);
+    return res.status(500).json({ error: 'Search failed.' });
+  }
+});
 
 // ─── Artist details (SC + YTM) ──────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
