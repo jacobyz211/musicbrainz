@@ -1,7 +1,7 @@
 {
   "name": "eclipse-allinone-addon",
   "version": "1.0.0",
-  "description": "Eclipse Music all-in-one addon using SoundCloud + YouTube Music search, HiFi + SoundCloud streaming, Redis, and MusicBrainz enrichment.",
+  "description": "Eclipse Music addon: SoundCloud + YouTube Music search, HiFi + SoundCloud streaming, Redis, auto SoundCloud client_id.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -13,7 +13,8 @@
     "express": "^4.19.2",
     "morgan": "^1.10.0",
     "nanoid": "^5.0.7",
-    "redis": "^4.6.13",
+    "ioredis": "^5.4.1",
+    "ytpl": "^2.3.0",
     "node-youtube-music": "^0.9.0"
   }
 }
