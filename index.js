@@ -11,7 +11,7 @@ const {
   searchArtists,
   getArtist,
   listMusicsFromAlbum
-} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62][web:74]
+} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62]
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -237,12 +237,12 @@ function scYear(x) {
   return (x.release_date || x.created_at || '').slice(0, 4) || null;
 }
 
-// For search we want all tracks visible, including SNIP/+; only block at stream time.
+// Allow everything except hard BLOCK for streaming; do not hide SNIP/+ from search.
 function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
   const p = t.policy;
-  if (!p || p === 'BLOCK') return false; // SNIP allowed; only hard-block BLOCK
+  if (!p || p === 'BLOCK') return false;
   return true;
 }
 
@@ -404,7 +404,7 @@ async function hifiFindBestTrack(meta, albumName) {
 
         let aScore = 0, bScore = 0;
         if (aTitle === wantTitle) aScore += 5;
-        if (bTitle === wantTitle) bScore += 5;
+        if (bTitle === wantTitle) aScore += 5;
         if (wantArtist && aArtist === wantArtist) aScore += 5;
         if (wantArtist && bArtist === wantArtist) aScore += 5;
         if (wantTitle && aTitle.includes(wantTitle)) aScore += 2;
@@ -570,7 +570,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: SoundCloud (tracks only) + YTM (all sections) ──────────────────
+// ─── Search: SC tracks + YTM tracks/albums/artists/playlists ────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -579,31 +579,35 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks only
-    const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
-      q,
-      limit: 40,
-      offset: 0,
-      linked_partitioning: 1
-    });
-
-    const scTracks = (trackRes.collection || [])
-      .filter(t => t) // no filtering; SNIP/+ visible
-      .map(t => {
-        rememberTrack(t);
-        const m = parseArtistTitle(t);
-        return {
-          id:         'sc:' + String(t.id),
-          title:      m.title || 'Unknown',
-          artist:     m.artist || 'Unknown',
-          album:      null,
-          duration:   t.duration ? Math.floor(t.duration / 1000) : null,
-          artworkURL: artworkUrl(t.artwork_url),
-          format:     'aac'
-        };
+    // SoundCloud tracks (no SNIP filter so previews/+ show)
+    let scTracks = [];
+    try {
+      const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
+        q,
+        limit: 40,
+        offset: 0,
+        linked_partitioning: 1
       });
+      scTracks = (trackRes.collection || [])
+        .filter(t => t)
+        .map(t => {
+          rememberTrack(t);
+          const m = parseArtistTitle(t);
+          return {
+            id:         'sc:' + String(t.id),
+            title:      m.title || 'Unknown',
+            artist:     m.artist || 'Unknown',
+            album:      null,
+            duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+            artworkURL: artworkUrl(t.artwork_url),
+            format:     'aac'
+          };
+        });
+    } catch (_e) {
+      scTracks = [];
+    }
 
-    // YouTube Music: tracks, artists, albums, playlists
+    // YTM: tracks, artists, albums, playlists
     let ytmTracks = [];
     let ytmArtists = [];
     let ytmAlbums = [];
@@ -675,7 +679,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytart') return res.status(400).json({ error: 'Unsupported artist id' });
 
   try {
-    const artist = await getArtist(artistId); // songs + albums [web:62][web:74]
+    const artist = await getArtist(artistId); // songs + albums [web:62]
 
     const name = artist.name || 'Artist';
     const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
@@ -718,7 +722,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytalb') return res.status(400).json({ error: 'Unsupported album id' });
 
   try {
-    const tracksData = await listMusicsFromAlbum(albumId); // songs for album [web:62][web:74]
+    const tracksData = await listMusicsFromAlbum(albumId); // songs for album [web:62]
     const tracks = (tracksData || []).map(m => ({
       id:       'yt:' + m.youtubeId,
       title:    m.title,
