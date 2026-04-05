@@ -713,7 +713,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
 
   try {
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // [web:62]
+      const artist = await getArtist(artistId); // same as before [web:62]
 
       const name = artist.name || 'Artist';
       const artworkURL =
@@ -721,6 +721,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
           ? artist.thumbnails[0].url
           : null;
 
+      // keep your existing mapping, just name it tracks
       const tracks = (artist.songs || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
@@ -739,13 +740,14 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         year:       a.year || undefined
       }));
 
+      // IMPORTANT: use "tracks" (like Claudochrome), not "topTracks"
       return res.json({
         id: rawId,
         name,
         artworkURL,
         bio: '',
         genres: [],
-        tracks,   // was topTracks
+        tracks,
         albums
       });
     }
@@ -780,7 +782,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL: artworkUrl(artist.avatar_url),
         bio: artist.description || '',
         genres: artist.genre ? [artist.genre] : [],
-        tracks,  // was topTracks
+        tracks,   // again, "tracks" not "topTracks"
         albums: []
       });
     }
