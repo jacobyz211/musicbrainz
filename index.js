@@ -11,7 +11,7 @@ const {
   searchArtists,
   getArtist,
   listMusicsFromAlbum
-} = require('node-youtube-music'); // still imported, but search is now optional[web:62]
+} = require('node-youtube-music'); // still imported, but search is now optional
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -908,7 +908,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   try {
     // YTM artist
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId);[web:62]
+      const artist = await getArtist(artistId);
       const name = artist.name || 'Artist';
       const artworkURL =
         artist.thumbnails && artist.thumbnails.length
@@ -1106,7 +1106,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
 
   try {
     if (prefix === 'ytalb') {
-      const tracksData = await listMusicsFromAlbum(albumId);[web:62]
+      const tracksData = await listMusicsFromAlbum(albumId);
       const tracks = (tracksData || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
