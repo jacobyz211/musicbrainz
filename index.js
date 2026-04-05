@@ -11,7 +11,7 @@ const {
   searchArtists,
   getArtist,
   listMusicsFromAlbum
-} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62][web:74]
+} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62]
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -237,12 +237,12 @@ function scYear(x) {
   return (x.release_date || x.created_at || '').slice(0, 4) || null;
 }
 
-// For search we want all tracks visible, including SNIP/+; only block at stream time.
+// Hide previews / SNIP in both search and stream, allow only fully playable
 function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
   const p = t.policy;
-  if (!p || p === 'BLOCK') return false; // SNIP allowed; only hard-block BLOCK
+  if (!p || p === 'SNIP' || p === 'BLOCK') return false;
   return true;
 }
 
@@ -404,7 +404,7 @@ async function hifiFindBestTrack(meta, albumName) {
 
         let aScore = 0, bScore = 0;
         if (aTitle === wantTitle) aScore += 5;
-        if (bTitle === wantTitle) bScore += 5;
+        if (bTitle === wantTitle) aScore += 5;
         if (wantArtist && aArtist === wantArtist) aScore += 5;
         if (wantArtist && bArtist === wantArtist) aScore += 5;
         if (wantTitle && aTitle.includes(wantTitle)) aScore += 2;
@@ -570,7 +570,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: SoundCloud (tracks only) + YTM (all sections) ──────────────────
+// ─── Search: SC + YTM for tracks, albums, artists, playlists ────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -579,16 +579,22 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks only
-    const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
-      q,
-      limit: 40,
-      offset: 0,
-      linked_partitioning: 1
-    });
+    // SoundCloud: tracks + playlists + users (for artists)
+    const results = await Promise.all([
+      scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',    { q, limit: 40, offset: 0, linked_partitioning: 1 }),
+      scGet(cid, 'https://api-v2.soundcloud.com/search/playlists', { q, limit: 15, offset: 0 }),
+      scGet(cid, 'https://api-v2.soundcloud.com/search/users',     { q, limit: 10, offset: 0 })
+    ].map(p => p.catch(() => null)));
 
+    const trackRes = results[0] || { collection: [] };
+    const plRes    = results[1] || { collection: [] };
+    const userRes  = results[2] || { collection: [] };
+
+    const allPl = plRes.collection || [];
+
+    // SC tracks: only fully playable (no previews/SNIP)
     const scTracks = (trackRes.collection || [])
-      .filter(t => t) // no filtering; SNIP/+ visible
+      .filter(t => t && isFullyPlayable(t))
       .map(t => {
         rememberTrack(t);
         const m = parseArtistTitle(t);
@@ -602,6 +608,35 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           format:     'aac'
         };
       });
+
+    const scAlbums = allPl
+      .filter(p => p.is_album === true)
+      .map(p => ({
+        id:         'scalb:' + String(p.id),
+        title:      p.title || 'Unknown',
+        artist:     (p.user && p.user.username) || 'Unknown',
+        artworkURL: artworkUrl(p.artwork_url),
+        trackCount: p.track_count || null,
+        year:       scYear(p)
+      }));
+
+    const scPlaylists = allPl
+      .filter(p => !p.is_album)
+      .map(p => ({
+        id:         'scpl:' + String(p.id),
+        title:      p.title || 'Unknown',
+        description: p.description || null,
+        artworkURL: artworkUrl(p.artwork_url),
+        creator:     (p.user && p.user.username) || null,
+        trackCount:  p.track_count || null
+      }));
+
+    const scArtists = (userRes.collection || []).map(u => ({
+      id:         'scart:' + String(u.id),
+      name:       u.username || 'Unknown',
+      artworkURL: artworkUrl(u.avatar_url),
+      genres:     u.genre ? [u.genre] : []
+    }));
 
     // YouTube Music: tracks, artists, albums, playlists
     let ytmTracks = [];
@@ -658,9 +693,9 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 
     res.json({
       tracks:    scTracks.concat(ytmTracks),
-      albums:    ytmAlbums,
-      artists:   ytmArtists,
-      playlists: ytmPlaylists
+      albums:    scAlbums.concat(ytmAlbums),
+      artists:   scArtists.concat(ytmArtists),
+      playlists: scPlaylists.concat(ytmPlaylists)
     });
   } catch (e) {
     console.error('[search] error', e.message);
@@ -668,79 +703,191 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Artist details (YTM) ───────────────────────────────────────────────────
+// ─── Artist details (SC + YTM) ──────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   const rawId = req.params.id || '';
   const [prefix, artistId] = rawId.split(':', 2);
-  if (prefix !== 'ytart') return res.status(400).json({ error: 'Unsupported artist id' });
+
+  const cid = effectiveCid(req.tokenEntry);
+  if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
   try {
-    const artist = await getArtist(artistId); // songs + albums [web:62][web:74]
+    if (prefix === 'ytart') {
+      const artist = await getArtist(artistId); // [web:62]
 
-    const name = artist.name || 'Artist';
-    const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
+      const name = artist.name || 'Artist';
+      const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
 
-    const topTracks = (artist.songs || []).map(m => ({
-      id:       'yt:' + m.youtubeId,
-      title:    m.title,
-      artist:   name,
-      duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
-    }));
+      const topTracks = (artist.songs || []).map(m => ({
+        id:       'yt:' + m.youtubeId,
+        title:    m.title,
+        artist:   name,
+        duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
+      }));
 
-    const albums = (artist.albums || []).map(a => ({
-      id:         'ytalb:' + a.albumId,
-      title:      a.name,
-      artist:     name,
-      artworkURL: a.thumbnailUrl || artworkURL,
-      trackCount: null,
-      year:       a.year || undefined
-    }));
+      const albums = (artist.albums || []).map(a => ({
+        id:         'ytalb:' + a.albumId,
+        title:      a.name,
+        artist:     name,
+        artworkURL: a.thumbnailUrl || artworkURL,
+        trackCount: null,
+        year:       a.year || undefined
+      }));
 
-    res.json({
-      id: rawId,
-      name,
-      artworkURL,
-      bio: '',
-      genres: [],
-      topTracks,
-      albums
-    });
+      return res.json({
+        id: rawId,
+        name,
+        artworkURL,
+        bio: '',
+        genres: [],
+        topTracks,
+        albums
+      });
+    }
+
+    if (prefix === 'scart') {
+      const artist = await scGet(cid, `https://api-v2.soundcloud.com/users/${artistId}`);
+      const tracksRes = await scGet(cid, `https://api-v2.soundcloud.com/users/${artistId}/tracks`, {
+        limit: 25,
+        linked_partitioning: 1
+      });
+
+      const topTracks = (tracksRes.collection || [])
+        .filter(t => t && isFullyPlayable(t))
+        .map(t => {
+          rememberTrack(t);
+          const m = parseArtistTitle(t);
+          return {
+            id:       'sc:' + String(t.id),
+            title:    m.title || 'Unknown',
+            artist:   m.artist || artist.username || 'Unknown',
+            duration: t.duration ? Math.floor(t.duration / 1000) : null
+          };
+        });
+
+      return res.json({
+        id: rawId,
+        name: artist.username || 'Unknown',
+        artworkURL: artworkUrl(artist.avatar_url),
+        bio: artist.description || '',
+        genres: artist.genre ? [artist.genre] : [],
+        topTracks,
+        albums: []
+      });
+    }
+
+    return res.status(400).json({ error: 'Unsupported artist id' });
   } catch (e) {
     console.error('[artist] error', e.message);
     res.status(500).json({ error: 'Artist lookup failed.' });
   }
 });
 
-// ─── Album details (YTM) ────────────────────────────────────────────────────
+// ─── Album details (SC + YTM) ───────────────────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   const rawId = req.params.id || '';
   const [prefix, albumId] = rawId.split(':', 2);
-  if (prefix !== 'ytalb') return res.status(400).json({ error: 'Unsupported album id' });
+
+  const cid = effectiveCid(req.tokenEntry);
+  if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
   try {
-    const tracksData = await listMusicsFromAlbum(albumId); // songs for album [web:62][web:74]
-    const tracks = (tracksData || []).map(m => ({
-      id:       'yt:' + m.youtubeId,
-      title:    m.title,
-      artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
-      duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
-    }));
+    if (prefix === 'ytalb') {
+      const tracksData = await listMusicsFromAlbum(albumId); // [web:62]
+      const tracks = (tracksData || []).map(m => ({
+        id:       'yt:' + m.youtubeId,
+        title:    m.title,
+        artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
+        duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
+      }));
 
-    res.json({
-      id: rawId,
-      title: tracksData && tracksData.length ? tracksData[0].album?.name || 'Album' : 'Album',
-      artist: tracksData && tracksData.length
-        ? (tracksData[0].artists && tracksData[0].artists.length ? tracksData[0].artists[0].name : '')
-        : '',
-      artworkURL: tracksData && tracksData.length ? tracksData[0].thumbnailUrl || null : null,
-      year: undefined,
-      description: '',
-      trackCount: tracks.length,
-      tracks
-    });
+      return res.json({
+        id: rawId,
+        title: tracksData && tracksData.length ? tracksData[0].album?.name || 'Album' : 'Album',
+        artist: tracksData && tracksData.length
+          ? (tracksData[0].artists && tracksData[0].artists.length ? tracksData[0].artists[0].name : '')
+          : '',
+        artworkURL: tracksData && tracksData.length ? tracksData[0].thumbnailUrl || null : null,
+        year: undefined,
+        description: '',
+        trackCount: tracks.length,
+        tracks
+      });
+    }
+
+    if (prefix === 'scalb') {
+      const pl = await scGet(cid, `https://api-v2.soundcloud.com/playlists/${albumId}`);
+      const tracks = (pl.tracks || [])
+        .filter(t => t && isFullyPlayable(t))
+        .map(t => {
+          rememberTrack(t);
+          const m = parseArtistTitle(t);
+          return {
+            id:       'sc:' + String(t.id),
+            title:    m.title || 'Unknown',
+            artist:   m.artist || (pl.user && pl.user.username) || 'Unknown',
+            duration: t.duration ? Math.floor(t.duration / 1000) : null
+          };
+        });
+
+      return res.json({
+        id: rawId,
+        title: pl.title || 'Album',
+        artist: (pl.user && pl.user.username) || 'Unknown',
+        artworkURL: artworkUrl(pl.artwork_url),
+        year: scYear(pl),
+        description: pl.description || '',
+        trackCount: tracks.length,
+        tracks
+      });
+    }
+
+    return res.status(400).json({ error: 'Unsupported album id' });
   } catch (e) {
     console.error('[album] error', e.message);
     res.status(500).json({ error: 'Album lookup failed.' });
+  }
+});
+
+// ─── Playlist details (SC + YTM) ────────────────────────────────────────────
+app.get('/u/:token/playlist/:id', tokenMiddleware, async (req, res) => {
+  const rawId = req.params.id || '';
+  const [prefix, playlistId] = rawId.split(':', 2);
+
+  const cid = effectiveCid(req.tokenEntry);
+  if (!cid) return res.status(503).json({ error: 'No client_id available.' });
+
+  try {
+    if (prefix === 'scpl') {
+      const pl = await scGet(cid, `https://api-v2.soundcloud.com/playlists/${playlistId}`);
+      const tracks = (pl.tracks || [])
+        .filter(t => t && isFullyPlayable(t))
+        .map(t => {
+          rememberTrack(t);
+          const m = parseArtistTitle(t);
+          return {
+            id:       'sc:' + String(t.id),
+            title:    m.title || 'Unknown',
+            artist:   m.artist || (pl.user && pl.user.username) || 'Unknown',
+            duration: t.duration ? Math.floor(t.duration / 1000) : null
+          };
+        });
+
+      return res.json({
+        id: rawId,
+        title: pl.title || 'Playlist',
+        description: pl.description || '',
+        artworkURL: artworkUrl(pl.artwork_url),
+        creator: (pl.user && pl.user.username) || null,
+        tracks
+      });
+    }
+
+    // For YTM playlists, Eclipse will just search by name or you can add listMusicsFromPlaylist
+    return res.status(400).json({ error: 'Unsupported playlist id' });
+  } catch (e) {
+    console.error('[playlist] error', e.message);
+    res.status(500).json({ error: 'Playlist lookup failed.' });
   }
 });
 
