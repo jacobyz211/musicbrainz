@@ -561,10 +561,10 @@ app.get('/health', (req, res) => {
 app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
     id:          'com.eclipse.allinone.' + req.params.token.slice(0, 8),
-    name:        'All-in-One Music',
+    name:        'All-in-One',
     version:     '1.0.0',
-    description: 'Search using SoundCloud + YouTube Music, and play through your configured audio sources.',
-    icon:        'https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/128x128/soundcloud.png',
+    description: 'Search using SoundCloud + YouTube Music',
+    icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRmBwAaJXf-E_3leRupHphGAs7ZH51og_IkfAgvW7vfgA&s=10',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist', 'file']
   });
