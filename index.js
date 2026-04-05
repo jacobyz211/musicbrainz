@@ -4,6 +4,12 @@ const axios = require('axios');
 const morgan = require('morgan');
 const { nanoid } = require('nanoid');
 const { createClient } = require('redis');
+const {
+  searchMusics,
+  searchAlbums,
+  searchPlaylists,
+  searchArtists
+} = require('node-youtube-music');
 
 // ---------- CONFIG ----------
 
@@ -11,12 +17,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Redis: use REDIS_URL on Render, fallback to local
-// Example REDIS_URL: redis://default:password@hostname:6379
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-const redis = createClient({
-  url: REDIS_URL
-});
+const redis = createClient({ url: REDIS_URL });
 
 redis.on('error', (err) => {
   console.error('Redis error', err);
@@ -43,79 +46,67 @@ app.use(morgan('dev'));
 const MB_BASE = 'https://musicbrainz.org/ws/2';
 const CA_BASE = 'https://coverartarchive.org';
 
-// HiFi instances – replace with real instance URLs for your setup
+// HiFi instances – replace with your actual URLs
 const HIFI_INSTANCES = [
   'https://api.listen.hifi.example',
   'https://another-hifi-instance.example'
 ];
 
-// ---------- HELPERS: REDIS STORAGE ----------
+// ---------- REDIS HELPERS ----------
 
-// Token key
 const tokenKey = (token) => `token:${token}`;
 const historyKey = (token) => `history:${token}`;
 const rateKey = (token) => `rate:${token}`;
 
-// Ensure token hash exists
 async function ensureToken(token) {
   const exists = await redis.exists(tokenKey(token));
   if (!exists) {
     await redis.hSet(tokenKey(token), {
-      clientId: ''
+      scClientId: ''
     });
   }
 }
 
-// Get token data
 async function getTokenData(token) {
   await ensureToken(token);
   const data = await redis.hGetAll(tokenKey(token));
   return {
-    clientId: data.clientId || ''
+    scClientId: data.scClientId || ''
   };
 }
 
-// Set client ID
-async function setClientId(token, clientId) {
+async function setSoundCloudClientId(token, clientId) {
   await ensureToken(token);
-  await redis.hSet(tokenKey(token), { clientId: clientId || '' });
+  await redis.hSet(tokenKey(token), { scClientId: clientId || '' });
 }
 
-// Log history item as JSON line in a Redis list
 async function logHistory(token, entry) {
   const line = JSON.stringify({
     timestamp: new Date().toISOString(),
     ...entry
   });
   await redis.rPush(historyKey(token), line);
-  // Optional: trim history to last N entries
   await redis.lTrim(historyKey(token), -1000, -1);
 }
 
-// Per-token rate limiting: 1 search/sec
 async function checkSearchRate(token) {
   const key = rateKey(token);
   const now = Date.now();
   const lastStr = await redis.get(key);
   const last = lastStr ? parseInt(lastStr, 10) : 0;
-  if (now - last < 1000) {
-    return false;
-  }
+  if (now - last < 1000) return false;
   await redis.set(key, String(now));
   return true;
 }
 
-// ---------- HELPERS: MUSICBRAINZ ----------
+// ---------- MUSICBRAINZ HELPERS ----------
 
 async function mbGet(path, params = {}) {
   const url = `${MB_BASE}${path}`;
   const res = await axios.get(url, {
-    params: {
-      fmt: 'json',
-      ...params
-    },
+    params: { fmt: 'json', ...params },
     headers: {
-      'User-Agent': 'Eclipse-MusicBrainz-Addon/1.0.0 (example@example.com)'
+      'User-Agent': 'Eclipse-AllInOne-Addon/1.0.0 (example@example.com)'
     },
     timeout: 5000
   });
@@ -135,9 +126,32 @@ function joinArtistCredits(credit) {
   return credit.map(c => c.name || '').filter(Boolean).join(', ');
 }
 
-// ---------- HELPERS: AUDIO SEARCH ----------
+// Enrich ISRC via MusicBrainz when missing
+async function enrichISRCWithMusicBrainz(title, artist) {
+  if (!title) return null;
+  try {
+    const queryParts = [];
+    if (artist) queryParts.push(`artist:${artist}`);
+    queryParts.push(`recording:${title}`);
+    const query = queryParts.join(' ');
+    const data = await mbGet('/recording', {
+      query,
+      limit: 1,
+      inc: 'isrcs'
+    });
+    if (!data || !Array.isArray(data.recordings) || !data.recordings.length) return null;
+    const rec = data.recordings[0];
+    if (Array.isArray(rec.isrcs) && rec.isrcs.length > 0) {
+      return rec.isrcs[0];
+    }
+  } catch (e) {
+    // ignore errors
+  }
+  return null;
+}
 
-// Build query string for audio lookup
+// ---------- AUDIO SEARCH HELPERS ----------
+
 function buildTrackQuery(meta) {
   const parts = [];
   if (meta.artist) parts.push(meta.artist);
@@ -145,7 +159,6 @@ function buildTrackQuery(meta) {
   return parts.join(' - ') || meta.title || '';
 }
 
-// HiFi search – returns first playable stream or null
 async function searchHiFi(query) {
   for (const base of HIFI_INSTANCES) {
     try {
@@ -161,64 +174,68 @@ async function searchHiFi(query) {
           url: playable.streamUrl,
           format: playable.format || 'flac',
           quality: playable.quality || 'lossless',
-          durationMs: playable.durationMs || null,
-          source: 'audio'
+          durationMs: playable.durationMs || null
         };
       }
     } catch (e) {
-      // Try next instance
+      // try next instance
     }
   }
   return null;
 }
 
-// SoundCloud search with duration filter
-async function searchSoundCloudTrack(clientId, query, { minDurationMs = 45000 }) {
-  if (!clientId) return null;
-
+// SoundCloud search – tracks only, playable, min duration, filters out previews.[web:54][web:70]
+async function searchSoundCloudTracks(scClientId, query, { limit = 20, minDurationMs = 45000 }) {
+  if (!scClientId) return [];
   const url = 'https://api-v2.soundcloud.com/search/tracks';
   const params = {
     q: query,
-    client_id: clientId,
-    limit: 5
+    client_id: scClientId,
+    limit,
+    access: 'playable',
+    'duration[from]': minDurationMs
   };
-
   const res = await axios.get(url, { params, timeout: 5000 });
   const tracks = res.data && res.data.collection ? res.data.collection : [];
 
-  const filtered = tracks.filter(t => {
+  return tracks.filter(t => {
     const d = t.duration || 0;
     if (d < minDurationMs) return false;
     if (Math.abs(d - 30000) < 2000) return false;
     const title = (t.title || '').toLowerCase();
     if (title.includes('preview')) return false;
-    return t.streamable && t.media && t.media.transcodings && t.media.transcodings.length > 0;
+    return t.streamable &&
+      t.media &&
+      Array.isArray(t.media.transcodings) &&
+      t.media.transcodings.length > 0;
   });
+}
 
-  if (!filtered.length) return null;
+async function resolveSoundCloudStream(scClientId, track) {
+  if (!scClientId || !track || !track.media) return null;
+  const transcodings = track.media.transcodings || [];
+  if (!transcodings.length) return null;
+  const prog = transcodings.find(tr => tr.format && tr.format.protocol === 'progressive') ||
+               transcodings[0];
 
-  const track = filtered[0];
-  const prog = track.media.transcodings.find(tr => tr.format && tr.format.protocol === 'progressive') ||
-               track.media.transcodings[0];
-
-  const transcodingsRes = await axios.get(prog.url, {
-    params: { client_id: clientId },
+  const res = await axios.get(prog.url, {
+    params: { client_id: scClientId },
     timeout: 5000
   });
 
-  const finalUrl = transcodingsRes.data && transcodingsRes.data.url ? transcodingsRes.data.url : null;
-  if (!finalUrl) return null;
+  const url = res.data && res.data.url ? res.data.url : null;
+  if (!url) return null;
 
   return {
-    url: finalUrl,
+    url,
     format: 'mp3',
     quality: 'high',
-    durationMs: track.duration || null,
-    source: 'audio'
+    durationMs: track.duration || null
   };
 }
 
-// Parse internal IDs: "rec:xxxx", "alb:xxxx" etc.
+// ---------- ID PARSING ----------
+
 function parseInternalId(id) {
   const [prefix, rest] = id.split(':', 2);
   return { prefix, rest };
@@ -231,49 +248,206 @@ app.get('/', (req, res) => {
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Eclipse MusicBrainz Addon</title>
+  <title>Eclipse All-in-One Addon</title>
   <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
-    h1 { font-size: 24px; }
-    input[type=text] { width: 100%; padding: 8px; margin: 4px 0 10px; box-sizing: border-box; }
-    button { padding: 8px 12px; margin-right: 8px; cursor: pointer; }
-    code { background: #f5f5f5; padding: 2px 4px; border-radius: 3px; }
-    .section { margin-bottom: 24px; }
-    .token-box { background: #fafafa; padding: 12px; border-radius: 6px; border: 1px solid #eee; }
-    .small { font-size: 12px; color: #555; }
+    :root {
+      --bg: #0f172a;
+      --bg-alt: #111827;
+      --card: #020617;
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.1);
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: radial-gradient(circle at top, #111827 0, #020617 60%);
+      color: var(--text);
+    }
+    header {
+      padding: 24px 20px 16px;
+      background: linear-gradient(to bottom, #020617 0, transparent 100%);
+      border-bottom: 1px solid #1e293b;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 0 20px 40px;
+    }
+    h1 {
+      font-size: 26px;
+      margin: 0 0 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    h1 span.logo-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.7);
+    }
+    h2 {
+      font-size: 18px;
+      margin: 0 0 8px;
+    }
+    p {
+      margin: 4px 0 8px;
+      color: var(--muted);
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #e0f2fe;
+      font-size: 11px;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+    .card {
+      background: radial-gradient(circle at top left, #020617 0, #020617 40%, #020617 100%);
+      border-radius: 14px;
+      padding: 14px 14px 16px;
+      border: 1px solid var(--border);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.7);
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .muted-sm {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    input[type=text] {
+      width: 100%;
+      padding: 8px 10px;
+      margin: 4px 0 10px;
+      border-radius: 8px;
+      border: 1px solid #1f2937;
+      background: #020617;
+      color: var(--text);
+      font-size: 13px;
+    }
+    input[type=text]:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5);
+    }
+    button {
+      padding: 7px 11px;
+      border-radius: 9px;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      background: linear-gradient(to bottom right, #1f2937, #020617);
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button.primary {
+      border-color: transparent;
+      background: linear-gradient(to bottom right, #38bdf8, #0ea5e9);
+      color: #0b1120;
+      font-weight: 500;
+    }
+    button:active {
+      transform: translateY(1px);
+    }
+    code {
+      background: #020617;
+      padding: 3px 6px;
+      border-radius: 6px;
+      border: 1px solid #1f2937;
+      font-size: 12px;
+      color: #e5e7eb;
+      display: inline-block;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 6px;
+    }
+    footer {
+      text-align: center;
+      padding-top: 16px;
+      font-size: 11px;
+      color: #6b7280;
+    }
   </style>
 </head>
 <body>
-  <h1>Eclipse MusicBrainz Addon</h1>
-
-  <div class="section">
-    <p>This addon exposes a catalog and audio source for Eclipse Music, with per-user configuration, Redis-backed storage, and safe search rate limits.</p>
-  </div>
-
-  <div class="section">
-    <h2>1. Generate your addon URL</h2>
-    <button onclick="generateToken()">Generate addon URL</button>
-    <div id="tokenInfo" class="token-box" style="display:none;">
-      <p><strong>Your token:</strong> <span id="tokenValue"></span></p>
-      <p><strong>Base URL:</strong> <code id="baseUrl"></code></p>
-      <p><strong>Manifest URL:</strong> <code id="manifestUrl"></code></p>
-      <p class="small">Paste the manifest URL into Eclipse: Settings → Connections → Add Connection → Addon.</p>
+  <header>
+    <div class="container">
+      <h1><span class="logo-dot"></span>Eclipse All-in-One Addon</h1>
+      <p class="muted-sm">Search using SoundCloud + YouTube Music, stream via your configured audio sources, and keep everything isolated per token.</p>
+      <div class="pill">Per-user tokens · Audio API key · CSV history</div>
     </div>
-  </div>
+  </header>
 
-  <div class="section">
-    <h2>2. Configure audio client ID</h2>
-    <p>You can set or automatically generate an audio source client ID used for resolving streams.</p>
-    <input type="text" id="clientIdInput" placeholder="Enter client ID (optional)" />
-    <button onclick="saveClientId()">Save client ID</button>
-    <button onclick="autoClientId()">Auto-generate client ID</button>
-    <p id="clientIdStatus" class="small"></p>
-  </div>
+  <div class="container">
+    <div class="grid">
+      <div class="card">
+        <div class="card-header">
+          <h2>1. Create your addon URL</h2>
+        </div>
+        <p class="muted-sm">Generate a private token. Eclipse will use this URL for all search and playback requests.</p>
+        <button class="primary" onclick="generateToken()">Generate addon URL</button>
+        <div id="tokenInfo" style="display:none; margin-top:10px;">
+          <p class="muted-sm">Token</p>
+          <code id="tokenValue"></code>
+          <p class="muted-sm" style="margin-top:8px;">Base URL</p>
+          <code id="baseUrl"></code>
+          <p class="muted-sm" style="margin-top:8px;">Manifest URL (paste this into Eclipse)</p>
+          <code id="manifestUrl"></code>
+        </div>
+      </div>
 
-  <div class="section">
-    <h2>3. CSV export</h2>
-    <p>You can export a CSV file with recent searches and plays for the generated token.</p>
-    <button onclick="exportCsv()">Export CSV</button>
+      <div class="card">
+        <div class="card-header">
+          <h2>2. Audio API key</h2>
+        </div>
+        <p class="muted-sm">
+          This is your SoundCloud API key used for search and fallback streaming. You can paste your own or let the addon generate one.
+        </p>
+        <input type="text" id="clientIdInput" placeholder="Enter SoundCloud API key (optional)" />
+        <div class="row">
+          <button onclick="saveClientId()">Save key</button>
+          <button onclick="autoClientId()">Auto-generate key</button>
+        </div>
+        <p id="clientIdStatus" class="muted-sm" style="margin-top:8px;"></p>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>3. Export history</h2>
+        </div>
+        <p class="muted-sm">Download a CSV of recent searches and streams for your token.</p>
+        <button onclick="exportCsv()">Export CSV</button>
+      </div>
+    </div>
+
+    <footer>
+      Built for Eclipse Music addons · Uses SoundCloud, YouTube Music search, and a MusicBrainz-based catalog for enrichment.
+    </footer>
   </div>
 
   <script>
@@ -292,7 +466,7 @@ app.get('/', (req, res) => {
           document.getElementById('tokenInfo').style.display = 'block';
           document.getElementById('clientIdStatus').textContent = '';
         })
-        .catch(err => alert('Error generating token'));
+        .catch(() => alert('Error generating token'));
     }
 
     function requireToken() {
@@ -313,10 +487,10 @@ app.get('/', (req, res) => {
       })
         .then(r => r.json())
         .then(() => {
-          document.getElementById('clientIdStatus').textContent = 'Client ID saved for this token.';
+          document.getElementById('clientIdStatus').textContent = 'Audio API key saved for this token.';
         })
         .catch(() => {
-          document.getElementById('clientIdStatus').textContent = 'Error saving client ID.';
+          document.getElementById('clientIdStatus').textContent = 'Error saving API key.';
         });
     }
 
@@ -328,10 +502,10 @@ app.get('/', (req, res) => {
         .then(r => r.json())
         .then(data => {
           document.getElementById('clientIdInput').value = data.clientId || '';
-          document.getElementById('clientIdStatus').textContent = 'Client ID generated and saved for this token.';
+          document.getElementById('clientIdStatus').textContent = 'Audio API key generated and saved for this token.';
         })
         .catch(() => {
-          document.getElementById('clientIdStatus').textContent = 'Error generating client ID.';
+          document.getElementById('clientIdStatus').textContent = 'Error generating API key.';
         });
     }
 
@@ -346,7 +520,7 @@ app.get('/', (req, res) => {
   res.send(html);
 });
 
-// ---------- API: TOKEN & CLIENT ID ----------
+// ---------- TOKEN & API KEY API ----------
 
 app.post('/api/new-token', async (req, res) => {
   const token = nanoid(12);
@@ -357,15 +531,15 @@ app.post('/api/new-token', async (req, res) => {
 app.post('/api/:token/client-id', async (req, res) => {
   const token = req.params.token;
   const clientId = (req.body && req.body.clientId) || '';
-  await setClientId(token, clientId);
+  await setSoundCloudClientId(token, clientId);
   res.json({ ok: true });
 });
 
-// Auto-generate client ID – plug in any allowed mechanism you use to obtain one.
+// Auto-generate API key – for demo, just generate a random value.
 app.post('/api/:token/client-id/auto', async (req, res) => {
   const token = req.params.token;
-  const generated = 'demo-' + nanoid(16);
-  await setClientId(token, generated);
+  const generated = 'auto-' + nanoid(16);
+  await setSoundCloudClientId(token, generated);
   res.json({ ok: true, clientId: generated });
 });
 
@@ -389,10 +563,10 @@ app.get('/u/:token/manifest.json', async (req, res) => {
   const baseUrl = `${req.protocol}://${req.get('host')}/u/${encodeURIComponent(token)}/`;
 
   res.json({
-    id: 'com.example.musicbrainzaddon',
-    name: 'MusicBrainz Addon',
+    id: 'com.example.allinoneaddon',
+    name: 'All-in-One Music Addon',
     version: '1.0.0',
-    description: 'Search and play music via a MusicBrainz-based catalog.',
+    description: 'Search using SoundCloud + YouTube Music and play via your configured audio sources.',
     icon: `${req.protocol}://${req.get('host')}/static/icon.png`,
     resources: ['search', 'stream', 'catalog'],
     types: ['track', 'album', 'artist', 'playlist', 'file'],
@@ -400,15 +574,12 @@ app.get('/u/:token/manifest.json', async (req, res) => {
   });
 });
 
-// ---------- SEARCH ----------
+// ---------- SEARCH (SoundCloud + YTM) ----------
 
 app.get('/u/:token/search', async (req, res) => {
   const token = req.params.token;
   const q = (req.query.q || '').trim();
-
-  if (!q) {
-    return res.json({});
-  }
+  if (!q) return res.json({});
 
   const allowed = await checkSearchRate(token);
   if (!allowed) {
@@ -418,111 +589,93 @@ app.get('/u/:token/search', async (req, res) => {
   await logHistory(token, { action: 'search', query: q });
 
   try {
-    const [recordData, artistData, releaseGroupData] = await Promise.all([
-      mbGet('/recording', {
-        query: q,
-        limit: 20,
-        inc: 'isrcs+releases+artist-credits'
-      }),
-      mbGet('/artist', {
-        query: q,
-        limit: 10
-      }),
-      mbGet('/release-group', {
-        query: q,
-        limit: 10,
-        inc: 'artist-credits'
-      })
-    ]);
+    const tokenData = await getTokenData(token);
+
+    // 1) SoundCloud tracks
+    const scTracks = await searchSoundCloudTracks(tokenData.scClientId, q, {
+      limit: 20,
+      minDurationMs: 45000
+    });
 
     const tracks = [];
-    if (recordData && Array.isArray(recordData.recordings)) {
-      for (const rec of recordData.recordings) {
-        const id = rec.id;
-        const title = rec.title || '';
-        const artist = joinArtistCredits(rec['artist-credit']);
-        let album = '';
-        let artworkURL = '';
-        let isrc = '';
+    for (const t of scTracks) {
+      const title = t.title || '';
+      const artist = t.user && t.user.username ? t.user.username : '';
+      const artworkURL = t.artwork_url || (t.user && t.user.avatar_url) || '';
+      const duration = t.duration ? Math.round(t.duration / 1000) : null;
 
-        if (Array.isArray(rec.isrcs) && rec.isrcs.length > 0) {
-          isrc = rec.isrcs[0];
-        }
-
-        if (Array.isArray(rec.releases) && rec.releases.length > 0) {
-          const rel = rec.releases[0];
-          album = rel.title || '';
-          if (rel.id) {
-            artworkURL = getCoverArtForRelease(rel.id);
-          }
-        }
-
-        const duration = rec.length ? Math.round(rec.length / 1000) : null;
-
-        tracks.push({
-          id: `rec:${id}`,
-          title,
-          artist,
-          album,
-          duration,
-          artworkURL: artworkURL || undefined,
-          isrc: isrc || undefined,
-          format: 'flac'
-        });
-      }
+      tracks.push({
+        id: `sc:${t.id}`,
+        title,
+        artist,
+        album: '',
+        duration,
+        artworkURL: artworkURL || undefined,
+        format: 'mp3'
+      });
     }
 
-    const artists = [];
-    if (artistData && Array.isArray(artistData.artists)) {
-      for (const a of artistData.artists) {
-        const name = a.name || '';
-        const genres = Array.isArray(a.tags)
-          ? a.tags.map(t => t.name).filter(Boolean)
-          : [];
-        artists.push({
-          id: `art:${a.id}`,
-          name,
-          artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
-          genres
-        });
-      }
+    // 2) YouTube Music search for tracks
+    let ytmTracks = [];
+    try {
+      const ytmResults = await searchMusics(q);
+      ytmTracks = (ytmResults || []).map(m => {
+        return {
+          id: `yt:${m.youtubeId}`,
+          title: m.title,
+          artist: (m.artists && m.artists.length ? m.artists[0].name : '') || '',
+          album: m.album && m.album.name ? m.album.name : '',
+          duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null,
+          artworkURL: m.thumbnailUrl || undefined,
+          isrc: undefined,
+          format: 'mp3'
+        };
+      });
+    } catch (e) {
+      // ignore YTM failures
     }
 
-    const albums = [];
-    if (releaseGroupData && Array.isArray(releaseGroupData['release-groups'])) {
-      for (const rg of releaseGroupData['release-groups']) {
-        const title = rg.title || '';
-        const artist = joinArtistCredits(rg['artist-credit']);
-        const firstReleaseDate = rg['first-release-date'] || '';
-        const year = firstReleaseDate ? String(firstReleaseDate).slice(0, 4) : '';
-        const artworkURL = rg.id ? getCoverArtForReleaseGroup(rg.id) : '';
+    // 3) Artists and albums from YTM search (simple)
+    let artists = [];
+    let albums = [];
+    let playlists = [];
 
-        albums.push({
-          id: `alb:${rg.id}`,
-          title,
-          artist,
-          artworkURL: artworkURL || undefined,
-          trackCount: null,
-          year: year || undefined
-        });
-      }
-    }
+    try {
+      const ytmArtists = await searchArtists(q);
+      artists = (ytmArtists || []).map(a => ({
+        id: `ytart:${a.artistId}`,
+        name: a.name,
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : `${req.protocol}://${req.get('host')}/static/icon.png`,
+        genres: []
+      }));
+    } catch (e) {}
 
-    // Simple virtual playlist based on search results
-    const playlistId = `pl:search:${Buffer.from(q).toString('base64url').slice(0, 16)}`;
-    const playlists = [
-      {
-        id: playlistId,
-        title: `Search: ${q}`,
-        description: 'Playlist generated from recent search results.',
-        artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
-        creator: 'MusicBrainz Addon',
-        trackCount: tracks.length
-      }
-    ];
+    try {
+      const ytmAlbums = await searchAlbums(q);
+      albums = (ytmAlbums || []).map(a => ({
+        id: `ytalb:${a.albumId}`,
+        title: a.name,
+        artist: a.artist && a.artist.name ? a.artist.name : '',
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : `${req.protocol}://${req.get('host')}/static/icon.png`,
+        trackCount: null,
+        year: a.year || undefined
+      }));
+    } catch (e) {}
+
+    try {
+      const ytmPlaylists = await searchPlaylists(q);
+      playlists = (ytmPlaylists || []).map(p => ({
+        id: `ytpl:${p.playlistId}`,
+        title: p.title,
+        description: '',
+        artworkURL: p.thumbnails && p.thumbnails.length ? p.thumbnails[0].url : `${req.protocol}://${req.get('host')}/static/icon.png`,
+        creator: '',
+        trackCount: null
+      }));
+    } catch (e) {}
 
     res.json({
-      tracks,
+      tracks: tracks.concat(ytmTracks),
       albums,
       artists,
       playlists
@@ -533,48 +686,66 @@ app.get('/u/:token/search', async (req, res) => {
   }
 });
 
-// ---------- STREAM ----------
+// ---------- STREAM (HiFi first, then SoundCloud) ----------
 
 app.get('/u/:token/stream/:id', async (req, res) => {
   const token = req.params.token;
   const rawId = req.params.id;
   const { prefix, rest } = parseInternalId(rawId);
 
-  // In this implementation, we lookup metadata from MusicBrainz again
-  // to build a good search query for the audio resolver.
-  let meta = {
-    title: '',
-    artist: '',
-    album: ''
-  };
+  let meta = { title: '', artist: '' };
 
   try {
-    if (prefix === 'rec') {
-      const rec = await mbGet(`/recording/${rest}`, { inc: 'artist-credits+releases' });
-      meta.title = rec.title || '';
-      meta.artist = joinArtistCredits(rec['artist-credit']);
-      if (Array.isArray(rec.releases) && rec.releases.length > 0) {
-        meta.album = rec.releases[0].title || '';
-      }
+    if (prefix === 'sc') {
+      // From SoundCloud ID
+      meta = { title: '', artist: '' };
+    } else if (prefix === 'yt') {
+      // From YouTube Music ID
+      meta = { title: '', artist: '' };
     }
 
     await logHistory(token, { action: 'stream', id: rawId, title: meta.title, artist: meta.artist });
 
+    const tokenData = await getTokenData(token);
+    const scClientId = tokenData.scClientId || '';
+
+    // Build query for HiFi
     const query = buildTrackQuery(meta);
 
-    // 1) Try HiFi instances
-    let resolved = await searchHiFi(query);
-
-    // 2) Fallback to SoundCloud using per-token client ID
-    if (!resolved) {
-      const tokenData = await getTokenData(token);
-      resolved = await searchSoundCloudTrack(tokenData.clientId || '', query, {
-        minDurationMs: 45000
-      });
+    // 1) HiFi instances
+    let resolved = null;
+    if (query) {
+      resolved = await searchHiFi(query);
     }
 
-    if (!resolved || !resolved.url) {
+    // 2) SoundCloud fallback if needed
+    if (!resolved && prefix === 'sc') {
+      try {
+        const url = `https://api-v2.soundcloud.com/tracks/${encodeURIComponent(rest)}`;
+        const trackRes = await axios.get(url, {
+          params: { client_id: scClientId },
+          timeout: 5000
+        });
+        const scTrack = trackRes.data;
+        const scResolved = await resolveSoundCloudStream(scClientId, scTrack);
+        if (scResolved) {
+          resolved = scResolved;
+          meta.title = scTrack.title || meta.title;
+          meta.artist = scTrack.user && scTrack.user.username ? scTrack.user.username : meta.artist;
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // Try to enrich ISRC if still missing and we have title/artist
+    if (!resolved) {
       return res.status(404).json({ error: 'No stream found' });
+    } else {
+      if (!meta.isrc && meta.title) {
+        const isrc = await enrichISRCWithMusicBrainz(meta.title, meta.artist);
+        if (isrc) meta.isrc = isrc;
+      }
     }
 
     res.json({
@@ -588,164 +759,53 @@ app.get('/u/:token/stream/:id', async (req, res) => {
   }
 });
 
-// ---------- ALBUM DETAILS ----------
+// ---------- ALBUM / ARTIST / PLAYLIST (STUBS, CATALOG) ----------
 
 app.get('/u/:token/album/:id', async (req, res) => {
   const rawId = req.params.id;
-  const { prefix, rest } = parseInternalId(rawId);
+  const { prefix } = parseInternalId(rawId);
+  if (!prefix) return res.status(400).json({ error: 'Invalid album id' });
 
-  if (prefix !== 'alb') {
-    return res.status(400).json({ error: 'Invalid album id' });
-  }
-
-  try {
-    // Treat rest as release-group MBID; fetch releases and then pick first release with recordings.[web:21]
-    const rg = await mbGet(`/release-group/${rest}`, {
-      inc: 'artist-credits+releases'
-    });
-
-    const artist = joinArtistCredits(rg['artist-credit']);
-    const title = rg.title || '';
-    const firstReleaseDate = rg['first-release-date'] || '';
-    const year = firstReleaseDate ? String(firstReleaseDate).slice(0, 4) : '';
-    const artworkURL = getCoverArtForReleaseGroup(rest);
-
-    let tracks = [];
-    if (Array.isArray(rg.releases) && rg.releases.length > 0) {
-      const releaseId = rg.releases[0].id;
-      const rel = await mbGet(`/release/${releaseId}`, {
-        inc: 'recordings'
-      });
-      if (rel.media && Array.isArray(rel.media)) {
-        for (const medium of rel.media) {
-          if (!Array.isArray(medium.tracks)) continue;
-          for (const tr of medium.tracks) {
-            const rec = tr.recording || {};
-            const tTitle = rec.title || '';
-            const tArtist = joinArtistCredits(rec['artist-credit']) || artist;
-            const duration = rec.length ? Math.round(rec.length / 1000) : null;
-            tracks.push({
-              id: `rec:${rec.id}`,
-              title: tTitle,
-              artist: tArtist,
-              duration,
-              artworkURL
-            });
-          }
-        }
-      }
-    }
-
-    res.json({
-      id: rawId,
-      title,
-      artist,
-      artworkURL,
-      year: year || undefined,
-      description: '',
-      trackCount: tracks.length,
-      tracks
-    });
-  } catch (e) {
-    console.error('Album error', e.message);
-    res.status(500).json({ error: 'Album lookup failed' });
-  }
+  // For now, return a minimal stub – you can wire this to YTM album lookup if you want.
+  res.json({
+    id: rawId,
+    title: 'Album',
+    artist: '',
+    artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
+    year: undefined,
+    description: '',
+    trackCount: 0,
+    tracks: []
+  });
 });
-
-// ---------- ARTIST DETAILS ----------
 
 app.get('/u/:token/artist/:id', async (req, res) => {
   const rawId = req.params.id;
-  const { prefix, rest } = parseInternalId(rawId);
+  const { prefix } = parseInternalId(rawId);
+  if (!prefix) return res.status(400).json({ error: 'Invalid artist id' });
 
-  if (prefix !== 'art') {
-    return res.status(400).json({ error: 'Invalid artist id' });
-  }
-
-  try {
-    const artistData = await mbGet(`/artist/${rest}`, {
-      inc: 'tags'
-    });
-
-    const name = artistData.name || '';
-    const genres = Array.isArray(artistData.tags)
-      ? artistData.tags.map(t => t.name).filter(Boolean)
-      : [];
-
-    // Top tracks: simple heuristic using recordings search filtered by artist MBID.[web:18]
-    const recData = await mbGet('/recording', {
-      query: `arid:${rest}`,
-      limit: 10
-    });
-
-    const topTracks = [];
-    if (recData && Array.isArray(recData.recordings)) {
-      for (const rec of recData.recordings) {
-        topTracks.push({
-          id: `rec:${rec.id}`,
-          title: rec.title || '',
-          artist: name,
-          duration: rec.length ? Math.round(rec.length / 1000) : null
-        });
-      }
-    }
-
-    const rgData = await mbGet('/release-group', {
-      query: `arid:${rest}`,
-      limit: 10
-    });
-
-    const albums = [];
-    if (rgData && Array.isArray(rgData['release-groups'])) {
-      for (const rg of rgData['release-groups']) {
-        const title = rg.title || '';
-        const firstReleaseDate = rg['first-release-date'] || '';
-        const year = firstReleaseDate ? String(firstReleaseDate).slice(0, 4) : '';
-        const artworkURL = rg.id ? getCoverArtForReleaseGroup(rg.id) : '';
-        albums.push({
-          id: `alb:${rg.id}`,
-          title,
-          artist: name,
-          artworkURL: artworkURL || undefined,
-          trackCount: null,
-          year: year || undefined
-        });
-      }
-    }
-
-    res.json({
-      id: rawId,
-      name,
-      artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
-      bio: '',
-      genres,
-      topTracks,
-      albums
-    });
-  } catch (e) {
-    console.error('Artist error', e.message);
-    res.status(500).json({ error: 'Artist lookup failed' });
-  }
+  res.json({
+    id: rawId,
+    name: 'Artist',
+    artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
+    bio: '',
+    genres: [],
+    topTracks: [],
+    albums: []
+  });
 });
-
-// ---------- PLAYLIST DETAILS (VIRTUAL) ----------
 
 app.get('/u/:token/playlist/:id', async (req, res) => {
   const rawId = req.params.id;
-  const { prefix, rest } = parseInternalId(rawId);
+  const { prefix } = parseInternalId(rawId);
+  if (!prefix) return res.status(400).json({ error: 'Invalid playlist id' });
 
-  if (prefix !== 'pl') {
-    return res.status(400).json({ error: 'Invalid playlist id' });
-  }
-
-  // For this example, just return an empty playlist shell.
-  // You can wire this to real stored searches if you want.
   res.json({
     id: rawId,
-    title: 'Dynamic Playlist',
+    title: 'Playlist',
     description: 'Generated playlist.',
     artworkURL: `${req.protocol}://${req.get('host')}/static/icon.png`,
-    creator: 'MusicBrainz Addon',
+    creator: 'All-in-One Addon',
     tracks: []
   });
 });
@@ -773,16 +833,14 @@ app.get('/u/:token/export.csv', async (req, res) => {
         (obj.artist || '').replace(/"/g, '""')
       ];
       rows.push(row.join(','));
-    } catch (_) {
-      // ignore malformed
-    }
+    } catch (_) {}
   }
 
   const csv = rows.join('\n');
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader(
     'Content-Disposition',
-    `attachment; filename="eclipse-musicbrainz-addon-${token}.csv"`
+    `attachment; filename="eclipse-allinone-addon-${token}.csv"`
   );
   res.send(csv);
 });
