@@ -11,7 +11,7 @@ const {
   searchArtists,
   getArtist,
   listMusicsFromAlbum
-} = require('node-youtube-music');
+} = require('node-youtube-music'); // YT Music search + artist/album detail [web:62][web:74]
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -569,7 +569,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: SoundCloud + YouTube Music (no snip filter) ────────────────────
+// ─── Search: SoundCloud + YouTube Music ─────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -578,35 +578,69 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks
-    const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
-      q,
-      limit: 40,
-      offset: 0,
-      linked_partitioning: 1
-    });
+    // SoundCloud tracks / playlists / users
+    const results = await Promise.all([
+      scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',    { q, limit: 30, offset: 0, linked_partitioning: 1 }),
+      scGet(cid, 'https://api-v2.soundcloud.com/search/playlists', { q, limit: 10, offset: 0 }),
+      scGet(cid, 'https://api-v2.soundcloud.com/search/users',     { q, limit: 5,  offset: 0 })
+    ].map(p => p.catch(() => null)));
 
-    const scTracks = (trackRes.collection || []).filter(t => t && isFullyPlayable(t));
+    const trackRes = results[0] || { collection: [] };
+    const plRes    = results[1] || { collection: [] };
+    const userRes  = results[2] || { collection: [] };
 
-    const scTrackItems = scTracks.map(t => {
-      rememberTrack(t);
-      const m = parseArtistTitle(t);
-      return {
-        id:         'sc:' + String(t.id),
-        title:      m.title || 'Unknown',
-        artist:     m.artist || 'Unknown',
-        album:      null,
-        duration:   t.duration ? Math.floor(t.duration / 1000) : null,
-        artworkURL: artworkUrl(t.artwork_url),
-        format:     'aac'
-      };
-    });
+    const allPl    = plRes.collection || [];
 
-    // YouTube Music tracks, artists, albums, playlists
+    const scTracks = (trackRes.collection || [])
+      .filter(t => t && isFullyPlayable(t))
+      .map(t => {
+        rememberTrack(t);
+        const m = parseArtistTitle(t);
+        return {
+          id:         'sc:' + String(t.id),
+          title:      m.title || 'Unknown',
+          artist:     m.artist || 'Unknown',
+          album:      null,
+          duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+          artworkURL: artworkUrl(t.artwork_url),
+          format:     'aac'
+        };
+      });
+
+    const scAlbums = allPl
+      .filter(p => p.is_album === true)
+      .map(p => ({
+        id:         'scalb:' + String(p.id),
+        title:      p.title || 'Unknown',
+        artist:     (p.user && p.user.username) || 'Unknown',
+        artworkURL: artworkUrl(p.artwork_url),
+        trackCount: p.track_count || null,
+        year:       scYear(p)
+      }));
+
+    const scPlaylists = allPl
+      .filter(p => !p.is_album)
+      .map(p => ({
+        id:         'scpl:' + String(p.id),
+        title:      p.title || 'Unknown',
+        description: p.description || null,
+        artworkURL: artworkUrl(p.artwork_url),
+        creator:     (p.user && p.user.username) || null,
+        trackCount:  p.track_count || null
+      }));
+
+    const scArtists = (userRes.collection || []).map(u => ({
+      id:         'scart:' + String(u.id),
+      name:       u.username || 'Unknown',
+      artworkURL: artworkUrl(u.avatar_url),
+      genres:     u.genre ? [u.genre] : []
+    }));
+
+    // YouTube Music: tracks, artists, albums, playlists
     let ytmTracks = [];
-    let artists   = [];
-    let albums    = [];
-    let playlists = [];
+    let ytmArtists = [];
+    let ytmAlbums = [];
+    let ytmPlaylists = [];
 
     try {
       const ytmRes = await searchMusics(q);
@@ -622,8 +656,8 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     } catch (_e) {}
 
     try {
-      const ytmArtists = await searchArtists(q);
-      artists = (ytmArtists || []).map(a => ({
+      const resArtists = await searchArtists(q);
+      ytmArtists = (resArtists || []).map(a => ({
         id:         'ytart:' + a.artistId,
         name:       a.name,
         artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
@@ -632,8 +666,8 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     } catch (_e) {}
 
     try {
-      const ytmAlbums = await searchAlbums(q);
-      albums = (ytmAlbums || []).map(a => ({
+      const resAlbums = await searchAlbums(q);
+      ytmAlbums = (resAlbums || []).map(a => ({
         id:         'ytalb:' + a.albumId,
         title:      a.name,
         artist:     a.artist && a.artist.name ? a.artist.name : '',
@@ -644,8 +678,8 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     } catch (_e) {}
 
     try {
-      const ytmPlaylists = await searchPlaylists(q);
-      playlists = (ytmPlaylists || []).map(p => ({
+      const resPlaylists = await searchPlaylists(q);
+      ytmPlaylists = (resPlaylists || []).map(p => ({
         id:         'ytpl:' + p.playlistId,
         title:      p.title,
         description: '',
@@ -656,10 +690,10 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
     } catch (_e) {}
 
     res.json({
-      tracks: scTrackItems.concat(ytmTracks),
-      albums,
-      artists,
-      playlists
+      tracks:    scTracks.concat(ytmTracks),
+      albums:    scAlbums.concat(ytmAlbums),
+      artists:   scArtists.concat(ytmArtists),
+      playlists: scPlaylists.concat(ytmPlaylists)
     });
   } catch (e) {
     console.error('[search] error', e.message);
@@ -674,7 +708,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytart') return res.status(400).json({ error: 'Unsupported artist id' });
 
   try {
-    const artist = await getArtist(artistId);
+    const artist = await getArtist(artistId); // songs + albums [web:62][web:74]
 
     const name = artist.name || 'Artist';
     const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
@@ -717,7 +751,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytalb') return res.status(400).json({ error: 'Unsupported album id' });
 
   try {
-    const tracksData = await listMusicsFromAlbum(albumId);
+    const tracksData = await listMusicsFromAlbum(albumId); // songs for album [web:62][web:74]
     const tracks = (tracksData || []).map(m => ({
       id:       'yt:' + m.youtubeId,
       title:    m.title,
