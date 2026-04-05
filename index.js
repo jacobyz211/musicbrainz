@@ -705,8 +705,29 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 
 // ─── Artist details (SC + YTM) ──────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
-  const rawId = req.params.id || '';
-  const [prefix, artistId] = rawId.split(':', 2);
+  let rawId = req.params.id || '';
+
+  // Support both "ytart:XYZ"/"scart:123" and bare IDs from search
+  let prefix = null;
+  let artistId = null;
+
+  if (rawId.startsWith('ytart:')) {
+    prefix   = 'ytart';
+    artistId = rawId.slice('ytart:'.length);
+  } else if (rawId.startsWith('scart:')) {
+    prefix   = 'scart';
+    artistId = rawId.slice('scart:'.length);
+  } else if (/^[a-zA-Z0-9_-]{6,}$/.test(rawId)) {
+    // Heuristic: long-ish non‑numeric → treat as YT Music artistId
+    prefix   = 'ytart';
+    artistId = rawId;
+    rawId    = 'ytart:' + artistId;
+  } else if (/^\d+$/.test(rawId)) {
+    // Pure numeric → treat as SoundCloud user id
+    prefix   = 'scart';
+    artistId = rawId;
+    rawId    = 'scart:' + artistId;
+  }
 
   const cid = effectiveCid(req.tokenEntry);
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
@@ -714,7 +735,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   try {
     // YOUTUBE MUSIC ARTIST
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // returns songs + albums etc. [web:62]
+      const artist = await getArtist(artistId); // songs + albums from node-youtube-music [web:62]
 
       const name = artist.name || 'Artist';
       const artworkURL =
@@ -722,7 +743,6 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
           ? artist.thumbnails[0].url
           : null;
 
-      // Eclipse expects "topTracks" with id/title/artist/duration/streamURL? [web:155]
       const topTracks = (artist.songs || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
@@ -730,7 +750,6 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         duration: m.duration && m.duration.totalSeconds
           ? m.duration.totalSeconds
           : null
-        // streamURL is optional; Eclipse will call /stream/{id} for yt:… ids
       }));
 
       const albums = (artist.albums || []).map(a => ({
@@ -748,8 +767,8 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL,
         bio: '',
         genres: [],
-        topTracks,  // IMPORTANT: this key name
-        albums      // and this key name
+        topTracks,   // matches addon guide
+        albums
       });
     }
 
@@ -784,12 +803,13 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL: artworkUrl(artist.avatar_url),
         bio: artist.description || '',
         genres: artist.genre ? [artist.genre] : [],
-        topTracks, // again: "topTracks" not "tracks"
-        albums: [] // SC: no album grouping yet, that's fine
+        topTracks,
+        albums: []
       });
     }
 
-    return res.status(400).json({ error: 'Unsupported artist id' });
+    // If we still couldn't classify, return a clear error
+    return res.status(400).json({ error: 'Unsupported or malformed artist id' });
   } catch (e) {
     console.error('[artist] error', e.message);
     res.status(500).json({ error: 'Artist lookup failed.' });
