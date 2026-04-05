@@ -837,6 +837,31 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         }
       }
 
+      // NEW: fetch this artist's SoundCloud "album" playlists and expose as albums
+      let albums = [];
+      if (artist) {
+        try {
+          const plRes = await scGet(
+            cid,
+            'https://api-v2.soundcloud.com/playlists',
+            { user_id: artistId, limit: 50, offset: 0 }
+          );
+          const collections = plRes.collection || plRes.playlists || [];
+          albums = collections
+            .filter(p => p && p.is_album === true)
+            .map(p => ({
+              id:         'scalb:' + String(p.id),           // matches /album handler
+              title:      p.title || 'Unknown',
+              artist:     artist.username || 'Unknown',
+              artworkURL: artworkUrl(p.artwork_url),
+              trackCount: p.track_count || null,
+              year:       scYear(p)
+            }));
+        } catch (e4) {
+          console.warn('[artist] SC albums fetch failed:', e4.message);
+        }
+      }
+
       return res.json({
         id: rawId,
         name: (artist && artist.username) || 'Unknown',
@@ -844,7 +869,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         bio: artist ? (artist.description || '') : '',
         genres: artist && artist.genre ? [artist.genre] : [],
         topTracks,
-        albums: []
+        albums      // now populated instead of []
       });
     }
 
