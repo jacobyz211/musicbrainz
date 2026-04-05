@@ -237,11 +237,12 @@ function scYear(x) {
   return (x.release_date || x.created_at || '').slice(0, 4) || null;
 }
 
+// For search we want all tracks visible, including SNIP/+; only block at stream time.
 function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
   const p = t.policy;
-  if (!p || p === 'SNIP' || p === 'BLOCK') return false;
+  if (!p || p === 'BLOCK') return false; // SNIP allowed; only hard-block BLOCK
   return true;
 }
 
@@ -569,7 +570,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: SoundCloud + YouTube Music ─────────────────────────────────────
+// ─── Search: SoundCloud (tracks only) + YTM (all sections) ──────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -578,21 +579,16 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks / playlists / users
-    const results = await Promise.all([
-      scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',    { q, limit: 30, offset: 0, linked_partitioning: 1 }),
-      scGet(cid, 'https://api-v2.soundcloud.com/search/playlists', { q, limit: 10, offset: 0 }),
-      scGet(cid, 'https://api-v2.soundcloud.com/search/users',     { q, limit: 5,  offset: 0 })
-    ].map(p => p.catch(() => null)));
-
-    const trackRes = results[0] || { collection: [] };
-    const plRes    = results[1] || { collection: [] };
-    const userRes  = results[2] || { collection: [] };
-
-    const allPl    = plRes.collection || [];
+    // SoundCloud tracks only
+    const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
+      q,
+      limit: 40,
+      offset: 0,
+      linked_partitioning: 1
+    });
 
     const scTracks = (trackRes.collection || [])
-      .filter(t => t && isFullyPlayable(t))
+      .filter(t => t) // no filtering; SNIP/+ visible
       .map(t => {
         rememberTrack(t);
         const m = parseArtistTitle(t);
@@ -606,35 +602,6 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
           format:     'aac'
         };
       });
-
-    const scAlbums = allPl
-      .filter(p => p.is_album === true)
-      .map(p => ({
-        id:         'scalb:' + String(p.id),
-        title:      p.title || 'Unknown',
-        artist:     (p.user && p.user.username) || 'Unknown',
-        artworkURL: artworkUrl(p.artwork_url),
-        trackCount: p.track_count || null,
-        year:       scYear(p)
-      }));
-
-    const scPlaylists = allPl
-      .filter(p => !p.is_album)
-      .map(p => ({
-        id:         'scpl:' + String(p.id),
-        title:      p.title || 'Unknown',
-        description: p.description || null,
-        artworkURL: artworkUrl(p.artwork_url),
-        creator:     (p.user && p.user.username) || null,
-        trackCount:  p.track_count || null
-      }));
-
-    const scArtists = (userRes.collection || []).map(u => ({
-      id:         'scart:' + String(u.id),
-      name:       u.username || 'Unknown',
-      artworkURL: artworkUrl(u.avatar_url),
-      genres:     u.genre ? [u.genre] : []
-    }));
 
     // YouTube Music: tracks, artists, albums, playlists
     let ytmTracks = [];
@@ -691,9 +658,9 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 
     res.json({
       tracks:    scTracks.concat(ytmTracks),
-      albums:    scAlbums.concat(ytmAlbums),
-      artists:   scArtists.concat(ytmArtists),
-      playlists: scPlaylists.concat(ytmPlaylists)
+      albums:    ytmAlbums,
+      artists:   ytmArtists,
+      playlists: ytmPlaylists
     });
   } catch (e) {
     console.error('[search] error', e.message);
