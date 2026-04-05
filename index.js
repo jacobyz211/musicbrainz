@@ -4,19 +4,16 @@ const axios   = require('axios');
 const crypto  = require('crypto');
 const Redis   = require('ioredis');
 const ytpl    = require('ytpl');
-const fs      = require('fs');
-const { exec, execFile } = require('child_process');
-const { promisify } = require('util');
-
-const execAsync     = promisify(exec);
-const execFileAsync = promisify(execFile);
+const { searchMusics, searchAlbums, searchPlaylists, searchArtists } = require('node-youtube-music');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// ─── Hi-Fi / Claudochrome instances (monochrome.tf) ─────────────────────────
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// ─── Hi-Fi / Claudochrome instances ─────────────────────────────────────────
 const HIFI_INSTANCES = [
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
@@ -29,9 +26,6 @@ const HIFI_INSTANCES = [
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-// ─── Hi-Fi client ────────────────────────────────────────────────────────────
 async function hifiGet(path, params) {
   const errors    = [];
   const instances = instanceHealthy
@@ -175,11 +169,8 @@ async function tokenMiddleware(req, res, next) {
 function getBaseUrl(req) {
   return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host');
 }
-function effectiveCid(e) {
-  return (e && e.clientId) ? e.clientId : SHARED_CLIENT_ID;
-}
 
-// ─── SoundCloud client_id ───────────────────────────────────────────────────
+// ─── SoundCloud client_id auto discovery ─────────────────────────────────────
 let SHARED_CLIENT_ID = null;
 const TRACK_CACHE    = new Map();
 const sleep          = ms => new Promise(r => setTimeout(r, ms));
@@ -239,13 +230,12 @@ function scYear(x) {
   return (x.release_date || x.created_at || '').slice(0, 4) || null;
 }
 
-// SNIP = SoundCloud 30-second preview. BLOCK = region-blocked.
 function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
   const p = t.policy;
   if (!p || p === 'SNIP' || p === 'BLOCK') return false;
-  return true; // ALLOW or MONETIZE
+  return true;
 }
 
 async function getHtml(url) {
@@ -354,26 +344,11 @@ async function scGet(cid, url, params, retried) {
   }
 }
 
-async function resolveStubs(cid, tracks, fbArt) {
-  const stubs = tracks.filter(t => !t.title).map(t => t.id);
-  const map   = {};
-  for (let i = 0; i < stubs.length; i += 50) {
-    try {
-      const data = await scGet(cid, 'https://api-v2.soundcloud.com/tracks', {
-        ids: stubs.slice(i, i + 50).join(',')
-      });
-      const arr = Array.isArray(data) ? data
-        : data.collection ? data.collection
-        : [];
-      arr.forEach(t => { map[String(t.id)] = t; });
-    } catch (e) {
-      console.warn('[resolveStubs] failed: ' + e.message);
-    }
-  }
-  return tracks.map(t => map[String(t.id)] || t).filter(t => !!t.title);
+function effectiveCid(e) {
+  return (e && e.clientId) ? e.clientId : SHARED_CLIENT_ID;
 }
 
-// ─── Smarter Hi-Fi track search (multiple retries/queries) ──────────────────
+// ─── Smarter Hi-Fi track search ─────────────────────────────────────────────
 async function hifiFindBestTrack(meta, albumName) {
   if (!meta || !meta.title) return null;
 
@@ -420,19 +395,14 @@ async function hifiFindBestTrack(meta, albumName) {
         );
 
         let aScore = 0, bScore = 0;
-
         if (aTitle === wantTitle) aScore += 5;
         if (bTitle === wantTitle) bScore += 5;
-
         if (wantArtist && aArtist === wantArtist) aScore += 5;
         if (wantArtist && bArtist === wantArtist) bScore += 5;
-
         if (wantTitle && aTitle.includes(wantTitle)) aScore += 2;
-        if (wantTitle && bTitle.includes(wantTitle)) bScore += 2;
-
+        if (wantTitle && bTitle.includes(wantTitle)) aScore += 2;
         if (wantArtist && aArtist.includes(wantArtist)) aScore += 2;
-        if (wantArtist && bArtist.includes(wantArtist)) bScore += 2;
-
+        if (wantArtist && bArtist.includes(wantArtist)) aScore += 2;
         return bScore - aScore;
       });
 
@@ -465,114 +435,63 @@ async function hifiFindBestTrack(meta, albumName) {
   return null;
 }
 
-// ─── YTM playlist import (unchanged) ────────────────────────────────────────
-async function importYtmPlaylist(playlistId) {
-  const cleanId = playlistId.replace(/^VL/, '');
-  try {
-    const pl = await ytpl(cleanId, { limit: Infinity });
-    return {
-      id:         'ytm-' + cleanId,
-      title:      pl.title || 'YouTube Music Playlist',
-      artworkURL: pl.bestThumbnail ? pl.bestThumbnail.url : null,
-      creator:    pl.author ? pl.author.name : 'YouTube Music',
-      tracks:     pl.items.map(item => ({
-        id:         'ytm-' + item.id,
-        title:      item.title || 'Unknown',
-        artist:     (item.author && item.author.name) || 'Unknown',
-        duration:   item.durationSec || null,
-        artworkURL: item.bestThumbnail ? item.bestThumbnail.url : null
-      }))
-    };
-  } catch (e) {
-    throw new Error('Could not fetch YouTube playlist: ' + e.message + '. Make sure it is Public.');
-  }
-}
-
-// ─── URL helpers ─────────────────────────────────────────────────────────────
-function detectUrlType(url) {
-  if (!url) return null;
-  if (/soundcloud\.com\/.*\/sets\//.test(url)) return 'scplaylist';
-  if (/on\.soundcloud\.com\//.test(url))       return 'scplaylist-short';
-  if (/snd\.sc\//.test(url))                   return 'scplaylist-short';
-  if (/music\.youtube\.com|youtube\.com.*\?list=/.test(url)) return 'ytmplaylist';
-  if (/music\.youtube\.com\/browse\/VL/.test(url))           return 'ytmplaylist';
-  return null;
-}
-
-function extractYtmId(url) {
-  const browse = url.match(/browse\/VL([a-zA-Z0-9_-]+)/);
-  if (browse) return browse[1];
-  const m = url.match(/[?&]list=([a-zA-Z0-9_-]+)/);
-  return m ? m[1] : null;
-}
-
-// ─── SC short URL expander ───────────────────────────────────────────────────
-async function expandScShortUrl(url) {
-  try {
-    const r = await axios.get(url, {
-      maxRedirects: 10,
-      headers: { 'User-Agent': UA },
-      timeout: 10000,
-      validateStatus: s => s < 500
-    });
-    const final = (r.request && r.request.res && r.request.res.responseUrl) || url;
-    console.log('[expandScShortUrl]', url, '->', final);
-    return final;
-  } catch (e) {
-    if (e.response && e.response.headers && e.response.headers.location) {
-      return e.response.headers.location;
-    }
-    return url;
-  }
-}
-
-// ─── SC playlist import ──────────────────────────────────────────────────────
-async function importScPlaylist(cid, scUrl) {
-  if (/on\.soundcloud\.com/.test(scUrl) || /snd\.sc/.test(scUrl)) {
-    scUrl = await expandScShortUrl(scUrl);
-  }
-  const res = await scGet(cid, 'https://api-v2.soundcloud.com/resolve', { url: scUrl });
-  if (!res) throw new Error('Could not resolve SoundCloud URL');
-  if (res.kind !== 'playlist') throw new Error('Not a playlist (kind=' + res.kind + ')');
-  const resolved = await resolveStubs(cid, res.tracks || [], res.artwork_url);
-  return {
-    id:         String(res.id),
-    title:      res.title || 'Imported',
-    artworkURL: artworkUrl(res.artwork_url),
-    creator:    (res.user && res.user.username) || null,
-    tracks:     resolved.map(t => {
-      rememberTrack(t);
-      const m = parseArtistTitle(t);
-      return {
-        id:         String(t.id),
-        title:      m.title || t.title || 'Unknown',
-        artist:     m.artist || (res.user && res.user.username) || 'Unknown',
-        duration:   t.duration ? Math.floor(t.duration / 1000) : null,
-        artworkURL: artworkUrl(t.artwork_url, res.artwork_url)
-      };
-    })
-  };
-}
-
-// ─── Config page (unchanged UI from your addon) ─────────────────────────────
+// ─── Simple config page (short version) ─────────────────────────────────────
 function buildConfigPage(baseUrl) {
-  // (this is exactly the HTML you pasted, unchanged)
-  // ...
-  // For brevity, you can keep your existing buildConfigPage implementation
-  // or paste the full function body here (it’s long but already working).
-  // I’m leaving it as-is in your code.
-  // ------------------------------
   let h = '';
   h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
   h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-  h += '<title>SoundCloud + Claudochrome Addon</title>';
-  // (rest of your original HTML here — keep as in your pasted code)
-  // ------------------------------
-  // For your actual file, paste the entire buildConfigPage function body you provided.
+  h += '<title>All-in-One Eclipse Addon</title>';
+  h += '<style>body{background:#050814;color:#e5e7eb;font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif;';
+  h += 'min-height:100vh;margin:0;display:flex;justify-content:center;align-items:flex-start;padding:40px 16px}';
+  h += '.card{background:#020617;border-radius:18px;border:1px solid #1f2937;max-width:520px;width:100%;padding:24px 22px;';
+  h += 'box-shadow:0 24px 80px rgba(15,23,42,0.9)}h1{font-size:22px;margin:0 0 4px}';
+  h += 'p{margin:4px 0 10px;color:#9ca3af}.lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#6b7280;margin-top:14px;margin-bottom:6px}';
+  h += 'input{width:100%;padding:10px 11px;border-radius:9px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;font-size:13px;margin-bottom:8px}';
+  h += 'input:focus{outline:none;border-color:#38bdf8;box-shadow:0 0 0 1px rgba(56,189,248,0.4)}code{background:#020617;border-radius:6px;padding:3px 6px;font-size:12px;border:1px solid #1f2937}';
+  h += 'button{cursor:pointer;border-radius:9px;border:1px solid rgba(148,163,184,0.4);padding:9px 12px;font-size:13px;';
+  h += 'background:linear-gradient(to bottom right,#1f2937,#020617);color:#e5e7eb;margin-top:6px}';
+  h += 'button.primary{border-color:transparent;background:linear-gradient(to bottom right,#38bdf8,#0ea5e9);color:#0b1120;font-weight:600}';
+  h += '.small{font-size:12px;color:#6b7280}.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}';
+  h += '.box{display:none;background:#020617;border-radius:10px;border:1px solid #111827;padding:12px;margin-top:12px;font-size:12px}';
+  h += '.label-sm{font-size:11px;color:#6b7280;margin-bottom:4px;text-transform:uppercase;letter-spacing:.08em}</style></head><body>';
+  h += '<div class="card">';
+  h += '<h1>All-in-One Music Addon</h1>';
+  h += '<p>Search using SoundCloud + YouTube Music, and play through your configured audio sources. Each URL below is unique per user.</p>';
+  h += '<div class="lbl">SoundCloud client_id <span style="text-transform:none;font-weight:400;color:#4b5563">(optional)</span></div>';
+  h += '<input id="clientId" placeholder="Leave blank to use the shared auto-refreshed ID">';
+  h += '<p class="small">You can paste your own client_id from SoundCloud network requests, or rely on the shared one.</p>';
+  h += '<button class="primary" id="genBtn" onclick="generate()">Generate my addon URL</button>';
+  h += '<div class="box" id="genBox"><div class="label-sm">Manifest URL (paste into Eclipse)</div><code id="genUrl"></code></div>';
+  h += '<div class="lbl">Existing addon URL</div>';
+  h += '<input id="existingUrl" placeholder="Paste a previously generated addon URL">';
+  h += '<button id="refBtn" onclick="refreshUrl()">Refresh existing URL</button>';
+  h += '<div class="box" id="refBox"><div class="label-sm">Refreshed manifest URL</div><code id="refUrl"></code></div>';
+  h += '<div class="lbl">CSV export</div>';
+  h += '<div class="row"><button onclick="exportCsv()">Export history CSV</button></div>';
+  h += '<p class="small" style="margin-top:10px">Keep your URL safe – it is tied to your token and settings.</p>';
+  h += '</div>';
+  h += '<script>';
+  h += 'let currentToken="";';
+  h += 'function generate(){const btn=document.getElementById("genBtn");const cid=document.getElementById("clientId").value.trim()||null;';
+  h += 'btn.disabled=true;btn.textContent="Generating...";';
+  h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({clientId:cid})})';
+  h += '.then(r=>r.json()).then(d=>{if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate my addon URL";return;}';
+  h += 'currentToken=d.token;document.getElementById("genUrl").textContent=d.manifestUrl;';
+  h += 'document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";})';
+  h += '.catch(e=>{alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate my addon URL";});}';
+  h += 'function refreshUrl(){const btn=document.getElementById("refBtn");const eu=document.getElementById("existingUrl").value.trim();const cid=document.getElementById("clientId").value.trim()||null;';
+  h += 'if(!eu){alert("Paste an existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";';
+  h += 'fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu,clientId:cid})})';
+  h += '.then(r=>r.json()).then(d=>{if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh existing URL";return;}';
+  h += 'currentToken=d.token;document.getElementById("refUrl").textContent=d.manifestUrl;';
+  h += 'document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh existing URL";})';
+  h += '.catch(e=>{alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh existing URL";});}';
+  h += 'function exportCsv(){if(!currentToken){alert("Generate or refresh a URL first.");return;}window.location.href="/u/"+currentToken+"/export.csv";}';
+  h += '</script></body></html>';
   return h;
 }
 
-// ─── Routes ─────────────────────────────────────────────────────────────────
+// ─── Routes: config page / generate / refresh / health ──────────────────────
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(buildConfigPage(getBaseUrl(req)));
@@ -618,11 +537,9 @@ app.post('/refresh', async (req, res) => {
   res.json({ token, manifestUrl: getBaseUrl(req) + '/u/' + token + '/manifest.json', refreshed: true });
 });
 
-// Health
 app.get('/health', (req, res) => {
   res.json({
     status:              'ok',
-    version:             '4.0.0',
     sharedClientIdReady: !!SHARED_CLIENT_ID,
     redisConnected:      !!(redis && redis.status === 'ready'),
     hifiInstance:        activeInstance,
@@ -635,17 +552,17 @@ app.get('/health', (req, res) => {
 // ─── Manifest ────────────────────────────────────────────────────────────────
 app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   res.json({
-    id:          'com.eclipse.soundcloud.' + req.params.token.slice(0, 8),
-    name:        'SoundCloud',
-    version:     '4.0.0',
-    description: 'Search and play SoundCloud content integrated into Eclipse, with enhanced streaming support.',
+    id:          'com.eclipse.allinone.' + req.params.token.slice(0, 8),
+    name:        'All-in-One Music',
+    version:     '1.0.0',
+    description: 'Search using SoundCloud + YouTube Music, and play through your configured audio sources.',
     icon:        'https://files.softicons.com/download/social-media-icons/simple-icons-by-dan-leech/png/128x128/soundcloud.png',
     resources:   ['search', 'stream', 'catalog'],
-    types:       ['track', 'album', 'artist', 'playlist']
+    types:       ['track', 'album', 'artist', 'playlist', 'file']
   });
 });
 
-// ─── Search (SoundCloud only, no filtering) ─────────────────────────────────
+// ─── Search: SoundCloud + YouTube Music ─────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -654,98 +571,129 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    const results = await Promise.all([
-      scGet(cid, 'https://api-v2.soundcloud.com/search/tracks',     { q, limit: 20, offset: 0, linked_partitioning: 1 }),
-      scGet(cid, 'https://api-v2.soundcloud.com/search/playlists',  { q, limit: 10, offset: 0 }),
-      scGet(cid, 'https://api-v2.soundcloud.com/search/users',      { q, limit: 5,  offset: 0 })
-    ].map(p => p.catch(() => null)));
+    // SoundCloud tracks
+    const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
+      q,
+      limit: 20,
+      offset: 0,
+      linked_partitioning: 1
+    });
 
-    const trackRes = results[0] || { collection: [] };
-    const plRes    = results[1] || { collection: [] };
-    const userRes  = results[2] || { collection: [] };
+    const scTracks = (trackRes.collection || []).filter(t => t);
 
-    const allPl    = plRes.collection || [];
+    const scTrackItems = scTracks.map(t => {
+      rememberTrack(t);
+      const m = parseArtistTitle(t);
+      return {
+        id:         'sc:' + String(t.id),
+        title:      m.title || 'Unknown',
+        artist:     m.artist || 'Unknown',
+        album:      null,
+        duration:   t.duration ? Math.floor(t.duration / 1000) : null,
+        artworkURL: artworkUrl(t.artwork_url),
+        format:     'aac'
+      };
+    });
 
-    const tracks = (trackRes.collection || [])
-      .map(t => {
-        rememberTrack(t);
-        const m = parseArtistTitle(t);
-        return {
-          id:         String(t.id),
-          title:      m.title || 'Unknown',
-          artist:     m.artist || 'Unknown',
-          album:      null,
-          duration:   t.duration ? Math.floor(t.duration / 1000) : null,
-          artworkURL: artworkUrl(t.artwork_url),
-          format:     'aac'
-        };
-      });
+    // YouTube Music tracks
+    let ytmTracks = [];
+    let artists   = [];
+    let albums    = [];
+    let playlists = [];
 
-    const albums = allPl
-      .filter(p => p.is_album === true)
-      .map(p => ({
-        id:         String(p.id),
-        title:      p.title || 'Unknown',
-        artist:     (p.user && p.user.username) || 'Unknown',
-        artworkURL: artworkUrl(p.artwork_url),
-        trackCount: p.track_count || null,
-        year:       scYear(p)
+    try {
+      const ytmRes = await searchMusics(q);
+      ytmTracks = (ytmRes || []).map(m => ({
+        id:       'yt:' + m.youtubeId,
+        title:    m.title,
+        artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
+        album:    m.album && m.album.name ? m.album.name : '',
+        duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null,
+        artworkURL: m.thumbnailUrl || undefined,
+        format: 'aac'
       }));
+    } catch (_e) {}
 
-    const playlists = allPl
-      .filter(p => !p.is_album)
-      .map(p => ({
-        id:         String(p.id),
-        title:      p.title || 'Unknown',
-        description: p.description || null,
-        artworkURL: artworkUrl(p.artwork_url),
-        creator:     (p.user && p.user.username) || null,
-        trackCount:  p.track_count || null
+    try {
+      const ytmArtists = await searchArtists(q);
+      artists = (ytmArtists || []).map(a => ({
+        id:         'ytart:' + a.artistId,
+        name:       a.name,
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
+        genres:     []
       }));
+    } catch (_e) {}
 
-    const artists = (userRes.collection || []).map(u => ({
-      id:         String(u.id),
-      name:       u.username || 'Unknown',
-      artworkURL: artworkUrl(u.avatar_url),
-      genres:     u.genre ? [u.genre] : []
-    }));
+    try {
+      const ytmAlbums = await searchAlbums(q);
+      albums = (ytmAlbums || []).map(a => ({
+        id:         'ytalb:' + a.albumId,
+        title:      a.name,
+        artist:     a.artist && a.artist.name ? a.artist.name : '',
+        artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : null,
+        trackCount: null,
+        year:       a.year || undefined
+      }));
+    } catch (_e) {}
 
-    res.json({ tracks, albums, artists, playlists });
+    try {
+      const ytmPlaylists = await searchPlaylists(q);
+      playlists = (ytmPlaylists || []).map(p => ({
+        id:         'ytpl:' + p.playlistId,
+        title:      p.title,
+        description: '',
+        artworkURL: p.thumbnails && p.thumbnails.length ? p.thumbnails[0].url : null,
+        creator:    '',
+        trackCount: null
+      }));
+    } catch (_e) {}
+
+    res.json({
+      tracks: scTrackItems.concat(ytmTracks),
+      albums,
+      artists,
+      playlists
+    });
   } catch (e) {
-    res.status(500).json({ error: 'Search failed, tracks only.', tracks: [] });
+    console.error('[search] error', e.message);
+    res.status(500).json({ error: 'Search failed.' });
   }
 });
 
-// ─── Stream (Claudochrome/Hi-Fi FIRST, SoundCloud fallback) ────────────────
+// ─── Stream: HiFi first, SoundCloud fallback ────────────────────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
-  const cid = effectiveCid(req.tokenEntry);
-  const tid = req.params.id;
+  const cid   = effectiveCid(req.tokenEntry);
+  const rawId = req.params.id || '';
+  const [prefix, rest] = rawId.split(':', 2);
 
   if (!cid) return res.status(503).json({ error: 'No client_id available.' });
 
-  let track  = null;
-  const cached = TRACK_CACHE.get(String(tid)) || null;
+  let meta = { title: '', artist: '', uploader: '' };
+  let track = null;
 
-  // Fetch SC track once for metadata and SC fallback
-  try {
+  if (prefix === 'sc') {
+    const tid = rest;
     try {
-      track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid);
-    } catch (_e) {
-      track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/' + tid);
+      try {
+        track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/soundcloud:tracks:' + tid);
+      } catch (_e) {
+        track = await scGet(cid, 'https://api-v2.soundcloud.com/tracks/' + tid);
+      }
+      if (track) {
+        rememberTrack(track);
+        meta = parseArtistTitle(track);
+      }
+    } catch (e) {
+      console.warn('[stream] SC lookup failed', e.message);
     }
-  } catch (e) {
-    console.warn('[stream] SC track lookup failed for ' + tid + ': ' + e.message);
   }
 
-  if (track) rememberTrack(track);
-
-  const meta = cached || (track ? parseArtistTitle(track) : null);
   const albumName =
     track && track.publisher_metadata && track.publisher_metadata.release_title
       ? track.publisher_metadata.release_title
       : null;
 
-  // 1) Claudochrome / Hi-Fi FIRST with smarter search
+  // 1) HiFi first
   try {
     const best = await hifiFindBestTrack(meta, albumName);
     if (best && best.id) {
@@ -789,31 +737,70 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
     }
   } catch (_e) {}
 
-  // 2) SoundCloud fallback
-  if (!track || !isFullyPlayable(track)) {
-    return res.status(404).json({ error: 'No playable stream found.' });
+  // 2) SoundCloud fallback for SC tracks
+  if (prefix === 'sc') {
+    if (!track || !isFullyPlayable(track)) {
+      return res.status(404).json({ error: 'No playable stream found.' });
+    }
+    try {
+      const trans = (track && track.media && track.media.transcodings) || [];
+      const prog  = trans.find(t => t.format && t.format.protocol === 'progressive') || trans[0];
+      if (!prog || !prog.url) throw new Error('No transcoding.');
+
+      const tr = await scGet(cid, prog.url, {}, false);
+      const url = tr && tr.url ? tr.url : null;
+      if (!url) throw new Error('No stream URL.');
+
+      return res.json({
+        url,
+        format:  'aac',
+        quality: 'high'
+      });
+    } catch (e) {
+      return res.status(500).json({ error: 'Stream failed.' });
+    }
   }
 
-  try {
-    const trans = (track && track.media && track.media.transcodings) || [];
-    const prog  = trans.find(t => t.format && t.format.protocol === 'progressive') || trans[0];
-    if (!prog || !prog.url) throw new Error('No transcoding.');
-
-    const tr = await scGet(cid, prog.url, {}, false);
-    const url = tr && tr.url ? tr.url : null;
-    if (!url) throw new Error('No stream URL.');
-
-    return res.json({
-      url,
-      format:  'aac',
-      quality: 'high'
-    });
-  } catch (e) {
-    return res.status(500).json({ error: 'Stream failed.' });
-  }
+  // For YT or unknown prefixes we currently have no direct stream
+  return res.status(404).json({ error: 'No stream found.' });
 });
 
-// (Playlist import routes etc. remain as in your original file)
+// ─── CSV export ──────────────────────────────────────────────────────────────
+app.get('/u/:token/export.csv', async (req, res) => {
+  const token = req.params.token;
+  if (!redis) {
+    return res.status(500).send('Redis not configured.');
+  }
+  const key = 'history:' + token;
+  const lines = await redis.lrange(key, 0, -1);
+
+  const rows = [
+    ['timestamp', 'action', 'query', 'id', 'title', 'artist'].join(',')
+  ];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      const row = [
+        obj.timestamp || '',
+        obj.action || '',
+        obj.query || '',
+        obj.id || '',
+        (obj.title || '').replace(/"/g, '""'),
+        (obj.artist || '').replace(/"/g, '""')
+      ];
+      rows.push(row.join(','));
+    } catch (_) {}
+  }
+
+  const csv = rows.join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="eclipse-allinone-addon-${token}.csv"`
+  );
+  res.send(csv);
+});
 
 // ─── Start server ───────────────────────────────────────────────────────────
 app.listen(PORT, () => {
