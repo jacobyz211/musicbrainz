@@ -718,12 +718,10 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
     prefix   = 'scart';
     artistId = rawId.slice('scart:'.length);
   } else if (/^[a-zA-Z0-9_-]{6,}$/.test(rawId)) {
-    // Heuristic: long-ish non-numeric → treat as YT Music artistId
     prefix   = 'ytart';
     artistId = rawId;
     rawId    = 'ytart:' + artistId;
   } else if (/^\d+$/.test(rawId)) {
-    // Pure numeric → treat as SoundCloud user id
     prefix   = 'scart';
     artistId = rawId;
     rawId    = 'scart:' + artistId;
@@ -735,7 +733,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   try {
     // YOUTUBE MUSIC ARTIST
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // [web:62]
+      const artist = await getArtist(artistId); // may or may not include albums[web:62]
 
       const name = artist.name || 'Artist';
       const artworkURL =
@@ -752,7 +750,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
           : null
       }));
 
-      const albums = (artist.albums || []).map(a => ({
+      let albums = (artist.albums || []).map(a => ({
         id:         'ytalb:' + a.albumId,
         title:      a.name,
         artist:     name,
@@ -760,6 +758,24 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         trackCount: null,
         year:       a.year || undefined
       }));
+
+      // Fallback: if getArtist() doesn't give albums, try listing them explicitly
+      if (!albums.length && artistId) {
+        try {
+          const { listAlbumsFromArtist } = require('node-youtube-music'); // same package[web:74]
+          const albList = await listAlbumsFromArtist(artistId);
+          albums = (albList || []).map(a => ({
+            id:         'ytalb:' + a.albumId,
+            title:      a.name,
+            artist:     name,
+            artworkURL: a.thumbnails && a.thumbnails.length ? a.thumbnails[0].url : artworkURL,
+            trackCount: null,
+            year:       a.year || undefined
+          }));
+        } catch (e2) {
+          console.warn('[artist] YTM listAlbumsFromArtist failed:', e2.message);
+        }
+      }
 
       return res.json({
         id: rawId,
@@ -837,29 +853,31 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         }
       }
 
-      // NEW: fetch this artist's SoundCloud "album" playlists and expose as albums
+      // Build albums for SC artist from our own search results (reliable)
       let albums = [];
-      if (artist) {
-        try {
-          const plRes = await scGet(
-            cid,
-            'https://api-v2.soundcloud.com/playlists',
-            { user_id: artistId, limit: 50, offset: 0 }
-          );
-          const collections = plRes.collection || plRes.playlists || [];
-          albums = collections
-            .filter(p => p && p.is_album === true)
-            .map(p => ({
-              id:         'scalb:' + String(p.id),           // matches /album handler
-              title:      p.title || 'Unknown',
-              artist:     artist.username || 'Unknown',
-              artworkURL: artworkUrl(p.artwork_url),
-              trackCount: p.track_count || null,
-              year:       scYear(p)
-            }));
-        } catch (e4) {
-          console.warn('[artist] SC albums fetch failed:', e4.message);
-        }
+      try {
+        const baseUrl = getBaseUrl(req);
+        const name = artist?.username || rawId;
+        const r = await axios.get(
+          `${baseUrl}/u/${req.params.token}/search`,
+          { params: { q: name }, timeout: 6000 }
+        );
+        const body = r.data || {};
+
+        const fromAlbums = (body.albums || []).filter(
+          a => a && a.id && String(a.id).startsWith('scalb:')
+        );
+
+        albums = fromAlbums.slice(0, 50).map(a => ({
+          id:         a.id,
+          title:      a.title,
+          artist:     a.artist || (artist && artist.username) || 'Unknown',
+          artworkURL: a.artworkURL || null,
+          trackCount: a.trackCount || null,
+          year:       a.year || undefined
+        }));
+      } catch (e4) {
+        console.warn('[artist] SC albums from /search failed:', e4.message);
       }
 
       return res.json({
@@ -869,7 +887,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         bio: artist ? (artist.description || '') : '',
         genres: artist && artist.genre ? [artist.genre] : [],
         topTracks,
-        albums      // now populated instead of []
+        albums
       });
     }
 
