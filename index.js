@@ -716,13 +716,18 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
       const artist = await getArtist(artistId); // [web:62]
 
       const name = artist.name || 'Artist';
-      const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
+      const artworkURL =
+        artist.thumbnails && artist.thumbnails.length
+          ? artist.thumbnails[0].url
+          : null;
 
-      const topTracks = (artist.songs || []).map(m => ({
+      const tracks = (artist.songs || []).map(m => ({
         id:       'yt:' + m.youtubeId,
         title:    m.title,
         artist:   name,
-        duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
+        duration: m.duration && m.duration.totalSeconds
+          ? m.duration.totalSeconds
+          : null
       }));
 
       const albums = (artist.albums || []).map(a => ({
@@ -740,19 +745,23 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL,
         bio: '',
         genres: [],
-        topTracks,
+        tracks,   // was topTracks
         albums
       });
     }
 
     if (prefix === 'scart') {
-      const artist = await scGet(cid, `https://api-v2.soundcloud.com/users/${artistId}`);
-      const tracksRes = await scGet(cid, `https://api-v2.soundcloud.com/users/${artistId}/tracks`, {
-        limit: 25,
-        linked_partitioning: 1
-      });
+      const artist = await scGet(
+        cid,
+        `https://api-v2.soundcloud.com/users/${artistId}`
+      );
+      const tracksRes = await scGet(
+        cid,
+        `https://api-v2.soundcloud.com/users/${artistId}/tracks`,
+        { limit: 25, linked_partitioning: 1 }
+      );
 
-      const topTracks = (tracksRes.collection || [])
+      const tracks = (tracksRes.collection || [])
         .filter(t => t && isFullyPlayable(t))
         .map(t => {
           rememberTrack(t);
@@ -771,7 +780,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL: artworkUrl(artist.avatar_url),
         bio: artist.description || '',
         genres: artist.genre ? [artist.genre] : [],
-        topTracks,
+        tracks,  // was topTracks
         albums: []
       });
     }
