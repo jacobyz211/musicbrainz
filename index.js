@@ -4,7 +4,7 @@ const axios   = require('axios');
 const crypto  = require('crypto');
 const Redis   = require('ioredis');
 const ytpl    = require('ytpl');
-const { searchMusics, searchAlbums, searchPlaylists, searchArtists } = require('node-youtube-music');
+const { searchMusics, searchAlbums, searchPlaylists, searchArtists, getArtist, listMusicsFromAlbum } = require('node-youtube-music');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -571,7 +571,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // ── SoundCloud tracks ──
+    // SoundCloud tracks
     const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
       q,
       limit: 40,
@@ -581,22 +581,18 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
 
     const rawScTracks = (trackRes.collection || []).filter(t => t);
 
-    // Filter out previews, short snips, and SoundCloud+ stuff
+    // Filter previews / snips / + tracks
     const scTracks = rawScTracks.filter(t => {
       if (!isFullyPlayable(t)) return false;
-
       const d = t.duration || 0;
-      if (d < 45000) return false;                 // < 45s → too short
-      if (Math.abs(d - 30000) < 2000) return false; // ~30s → classic preview/snippet
-
+      if (d < 45000) return false;
+      if (Math.abs(d - 30000) < 2000) return false;
       const title = (t.title || '').toLowerCase();
       const desc  = (t.description || '').toLowerCase();
       const label = (t.label_name || '').toLowerCase();
-
       if (title.includes('preview') || title.includes('snippet') || title.includes('snip')) return false;
       if (desc.includes('preview') || desc.includes('snippet')) return false;
       if (title.includes('soundcloud+') || label.includes('soundcloud+') || desc.includes('soundcloud+')) return false;
-
       return true;
     });
 
@@ -614,7 +610,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       };
     });
 
-    // ── YouTube Music: tracks, artists, albums, playlists ──
+    // YouTube Music tracks, artists, albums, playlists
     let ytmTracks = [];
     let artists   = [];
     let albums    = [];
@@ -676,6 +672,82 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   } catch (e) {
     console.error('[search] error', e.message);
     res.status(500).json({ error: 'Search failed.' });
+  }
+});
+
+// ─── Artist details (YTM) ───────────────────────────────────────────────────
+app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
+  const rawId = req.params.id || '';
+  const [prefix, artistId] = rawId.split(':', 2);
+  if (prefix !== 'ytart') return res.status(400).json({ error: 'Unsupported artist id' });
+
+  try {
+    const artist = await getArtist(artistId);
+
+    const name = artist.name || 'Artist';
+    const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
+
+    const topTracks = (artist.songs || []).map(m => ({
+      id:       'yt:' + m.youtubeId,
+      title:    m.title,
+      artist:   name,
+      duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
+    }));
+
+    const albums = (artist.albums || []).map(a => ({
+      id:         'ytalb:' + a.albumId,
+      title:      a.name,
+      artist:     name,
+      artworkURL: a.thumbnailUrl || artworkURL,
+      trackCount: null,
+      year:       a.year || undefined
+    }));
+
+    res.json({
+      id: rawId,
+      name,
+      artworkURL,
+      bio: '',
+      genres: [],
+      topTracks,
+      albums
+    });
+  } catch (e) {
+    console.error('[artist] error', e.message);
+    res.status(500).json({ error: 'Artist lookup failed.' });
+  }
+});
+
+// ─── Album details (YTM) ────────────────────────────────────────────────────
+app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
+  const rawId = req.params.id || '';
+  const [prefix, albumId] = rawId.split(':', 2);
+  if (prefix !== 'ytalb') return res.status(400).json({ error: 'Unsupported album id' });
+
+  try {
+    const tracksData = await listMusicsFromAlbum(albumId);
+    const tracks = (tracksData || []).map(m => ({
+      id:       'yt:' + m.youtubeId,
+      title:    m.title,
+      artist:   (m.artists && m.artists.length ? m.artists[0].name : '') || '',
+      duration: m.duration && m.duration.totalSeconds ? m.duration.totalSeconds : null
+    }));
+
+    res.json({
+      id: rawId,
+      title: tracksData && tracksData.length ? tracksData[0].album?.name || 'Album' : 'Album',
+      artist: tracksData && tracksData.length
+        ? (tracksData[0].artists && tracksData[0].artists.length ? tracksData[0].artists[0].name : '')
+        : '',
+      artworkURL: tracksData && tracksData.length ? tracksData[0].thumbnailUrl || null : null,
+      year: undefined,
+      description: '',
+      trackCount: tracks.length,
+      tracks
+    });
+  } catch (e) {
+    console.error('[album] error', e.message);
+    res.status(500).json({ error: 'Album lookup failed.' });
   }
 });
 
