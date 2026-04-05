@@ -4,7 +4,14 @@ const axios   = require('axios');
 const crypto  = require('crypto');
 const Redis   = require('ioredis');
 const ytpl    = require('ytpl');
-const { searchMusics, searchAlbums, searchPlaylists, searchArtists, getArtist, listMusicsFromAlbum } = require('node-youtube-music');
+const {
+  searchMusics,
+  searchAlbums,
+  searchPlaylists,
+  searchArtists,
+  getArtist,
+  listMusicsFromAlbum
+} = require('node-youtube-music'); // supports search + artist/album details [web:62][web:76]
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -234,7 +241,7 @@ function isFullyPlayable(t) {
   if (!t) return false;
   if (t.streamable === false) return false;
   const p = t.policy;
-  if (!p || p === 'SNIP' || p === 'BLOCK') return false;
+  if (!p || p === 'SNIP' || p === 'BLOCK') return false; // SNIP/BLOCK are previews/blocked [web:88]
   return true;
 }
 
@@ -562,7 +569,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, (req, res) => {
   });
 });
 
-// ─── Search: SoundCloud + YouTube Music ─────────────────────────────────────
+// ─── Search: SoundCloud + YouTube Music (no SC filters) ─────────────────────
 app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   const q = cleanText(req.query.q);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
@@ -571,7 +578,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks
+    // SoundCloud tracks (unfiltered except basic streamability)
     const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
       q,
       limit: 40,
@@ -579,22 +586,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       linked_partitioning: 1
     });
 
-    const rawScTracks = (trackRes.collection || []).filter(t => t);
-
-    // Filter previews / snips / + tracks
-    const scTracks = rawScTracks.filter(t => {
-      if (!isFullyPlayable(t)) return false;
-      const d = t.duration || 0;
-      if (d < 45000) return false;
-      if (Math.abs(d - 30000) < 2000) return false;
-      const title = (t.title || '').toLowerCase();
-      const desc  = (t.description || '').toLowerCase();
-      const label = (t.label_name || '').toLowerCase();
-      if (title.includes('preview') || title.includes('snippet') || title.includes('snip')) return false;
-      if (desc.includes('preview') || desc.includes('snippet')) return false;
-      if (title.includes('soundcloud+') || label.includes('soundcloud+') || desc.includes('soundcloud+')) return false;
-      return true;
-    });
+    const scTracks = (trackRes.collection || []).filter(t => t && isFullyPlayable(t));
 
     const scTrackItems = scTracks.map(t => {
       rememberTrack(t);
@@ -682,7 +674,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytart') return res.status(400).json({ error: 'Unsupported artist id' });
 
   try {
-    const artist = await getArtist(artistId);
+    const artist = await getArtist(artistId); // exposes songs+albums for artist [web:74][web:75]
 
     const name = artist.name || 'Artist';
     const artworkURL = artist.thumbnails && artist.thumbnails.length ? artist.thumbnails[0].url : null;
@@ -725,7 +717,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   if (prefix !== 'ytalb') return res.status(400).json({ error: 'Unsupported album id' });
 
   try {
-    const tracksData = await listMusicsFromAlbum(albumId);
+    const tracksData = await listMusicsFromAlbum(albumId); // returns songs for an album [web:62][web:74]
     const tracks = (tracksData || []).map(m => ({
       id:       'yt:' + m.youtubeId,
       title:    m.title,
@@ -751,7 +743,7 @@ app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
   }
 });
 
-// ─── Stream: HiFi first, SoundCloud fallback ────────────────────────────────
+// ─── Stream: HiFi first, SoundCloud fallback (unchanged) ────────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async (req, res) => {
   const cid   = effectiveCid(req.tokenEntry);
   const rawId = req.params.id || '';
