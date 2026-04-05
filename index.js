@@ -718,7 +718,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
     prefix   = 'scart';
     artistId = rawId.slice('scart:'.length);
   } else if (/^[a-zA-Z0-9_-]{6,}$/.test(rawId)) {
-    // Heuristic: long-ish non‑numeric → treat as YT Music artistId
+    // Heuristic: long-ish non-numeric → treat as YT Music artistId
     prefix   = 'ytart';
     artistId = rawId;
     rawId    = 'ytart:' + artistId;
@@ -735,7 +735,7 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
   try {
     // YOUTUBE MUSIC ARTIST
     if (prefix === 'ytart') {
-      const artist = await getArtist(artistId); // songs + albums from node-youtube-music [web:62]
+      const artist = await getArtist(artistId); // [web:62]
 
       const name = artist.name || 'Artist';
       const artworkURL =
@@ -767,16 +767,14 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         artworkURL,
         bio: '',
         genres: [],
-        topTracks,   // matches addon guide
+        topTracks,
         albums
       });
     }
 
-    // inside app.get('/u/:token/artist/:id', ...) keep YTM part as‑is and replace only the scart block:
-
+    // SOUNDCLOUD ARTIST
     if (prefix === 'scart') {
       let artist;
-
       try {
         artist = await scGet(
           cid,
@@ -789,7 +787,6 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
       let topTracks = [];
 
       if (artist) {
-        // Primary path: real SC API call (when not 403)
         try {
           const tracksRes = await scGet(
             cid,
@@ -818,14 +815,16 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
       if ((!artist || topTracks.length === 0) && rawId) {
         try {
           const baseUrl = getBaseUrl(req);
-          const name = artist?.username || rawId; // best guess
+          const name = artist?.username || rawId;
           const r = await axios.get(
             `${baseUrl}/u/${req.params.token}/search`,
             { params: { q: name }, timeout: 6000 }
           );
 
           const body = r.data || {};
-          const fromTracks = (body.tracks || []).filter(t => t && t.id && String(t.id).startsWith('sc:'));
+          const fromTracks = (body.tracks || []).filter(
+            t => t && t.id && String(t.id).startsWith('sc:')
+          );
 
           topTracks = fromTracks.slice(0, 25).map(t => ({
             id:       t.id,
@@ -845,9 +844,16 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async (req, res) => {
         bio: artist ? (artist.description || '') : '',
         genres: artist && artist.genre ? [artist.genre] : [],
         topTracks,
-        albums: [] // SC albums still empty, which Eclipse handles fine
+        albums: []
       });
     }
+
+    return res.status(400).json({ error: 'Unsupported or malformed artist id' });
+  } catch (e) {
+    console.error('[artist] error', e.message);
+    res.status(500).json({ error: 'Artist lookup failed.' });
+  }
+});
 
 // ─── Album details (SC + YTM) ───────────────────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async (req, res) => {
