@@ -571,15 +571,34 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
   if (!cid) return res.status(503).json({ error: 'No client_id yet. Retry in a few seconds.' });
 
   try {
-    // SoundCloud tracks
+    // ── SoundCloud tracks ──
     const trackRes = await scGet(cid, 'https://api-v2.soundcloud.com/search/tracks', {
       q,
-      limit: 20,
+      limit: 40,
       offset: 0,
       linked_partitioning: 1
     });
 
-    const scTracks = (trackRes.collection || []).filter(t => t);
+    const rawScTracks = (trackRes.collection || []).filter(t => t);
+
+    // Filter out previews, short snips, and SoundCloud+ stuff
+    const scTracks = rawScTracks.filter(t => {
+      if (!isFullyPlayable(t)) return false;
+
+      const d = t.duration || 0;
+      if (d < 45000) return false;                 // < 45s → too short
+      if (Math.abs(d - 30000) < 2000) return false; // ~30s → classic preview/snippet
+
+      const title = (t.title || '').toLowerCase();
+      const desc  = (t.description || '').toLowerCase();
+      const label = (t.label_name || '').toLowerCase();
+
+      if (title.includes('preview') || title.includes('snippet') || title.includes('snip')) return false;
+      if (desc.includes('preview') || desc.includes('snippet')) return false;
+      if (title.includes('soundcloud+') || label.includes('soundcloud+') || desc.includes('soundcloud+')) return false;
+
+      return true;
+    });
 
     const scTrackItems = scTracks.map(t => {
       rememberTrack(t);
@@ -595,7 +614,7 @@ app.get('/u/:token/search', tokenMiddleware, async (req, res) => {
       };
     });
 
-    // YouTube Music tracks
+    // ── YouTube Music: tracks, artists, albums, playlists ──
     let ytmTracks = [];
     let artists   = [];
     let albums    = [];
