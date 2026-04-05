@@ -1,7 +1,7 @@
 {
-  "name": "eclipse-musicbrainz-addon",
+  "name": "eclipse-allinone-addon",
   "version": "1.0.0",
-  "description": "Eclipse Music addon using MusicBrainz with multi-source audio resolution and Redis.",
+  "description": "Eclipse Music all-in-one addon using SoundCloud + YouTube Music search, HiFi + SoundCloud streaming, Redis, and MusicBrainz enrichment.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -13,6 +13,7 @@
     "express": "^4.19.2",
     "morgan": "^1.10.0",
     "nanoid": "^5.0.7",
-    "redis": "^4.6.13"
+    "redis": "^4.6.13",
+    "node-youtube-music": "^0.9.0"
   }
 }
