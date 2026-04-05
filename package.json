@@ -1,21 +1,18 @@
 {
-  "name": "bandcamp-eclipse-addon",
+  "name": "eclipse-musicbrainz-addon",
   "version": "1.0.0",
-  "description": "Bandcamp + MusicBrainz Eclipse Music addon with personal token URLs and Redis persistence",
-  "type": "module",
+  "description": "Eclipse Music addon using MusicBrainz with multi-source audio resolution and Redis.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "start": "node index.js",
+    "build": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "bandcamp-fetch": "^3.0.0",
+    "axios": "^1.7.0",
     "cors": "^2.8.5",
-    "express": "^4.18.0",
-    "ioredis": "^5.3.0",
-    "p-queue": "^8.0.0"
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "nanoid": "^5.0.7",
+    "redis": "^4.6.13"
   }
 }
